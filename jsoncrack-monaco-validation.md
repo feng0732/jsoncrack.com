@@ -657,16 +657,121 @@ type ParseJsonGraphResult =
 | BottomBar | Invalid | Valid（因为第二层错误没冒泡） |
 | 常见程度 | 非常常见（每次输入无效内容） | 几乎不常见（需要绕过第一层校验） |
 
-#### 8.7.4 什么情况下会走到第二层的错误？
+#### 8.7.4 第二层语法错误路径的可达入口：三种入口分析
 
-由于第一层 `contentToJson` 已经做了严格校验（JSON 格式下甚至用 `JSON.parse` 二次校验），绝大多数无效输入在第一层就被拦下了（保留旧图 + BottomBar Invalid）。第二层的错误/空图场景主要出现在：
+第一层 `contentToJson` 已经做了严格校验（JSON 格式下甚至用 `JSON.parse` 二次校验），所以通过**普通编辑器输入**几乎不可能让无效 JSON 到达第二层。但项目中存在三种不同的数据入口，它们经过的校验路径完全不同：
 
-1. **直接操作 `useJson` store**：绕过 `useFile.setContents`，比如调用 `useJson.getState().setJson("garbage")`
-2. **`contentToJson` 成功但 `parseTree` 完全失败**：理论上可能，但 `jsonc-parser` 的容错度很高，很难触发
-3. **节点数超限**：超大 JSON 节点数超过 `maxRenderableNodes`
-4. **`parseGraph` 内部 bug**：计算节点大小、遍历 AST 时抛异常（极罕见）
+##### 入口 A：普通编辑器输入（www 主应用）
 
-> 在正常的编辑器输入流程中，**用户几乎只会遇到"第一层拦下载入旧图"的场景**，第二层的清空画布是理论上的边界情况。
+```
+Monaco onChange → useFile.setContents({ contents, skipUpdate: true })
+  → contentToJson(contents, format)    ← 第一层校验（严格）
+    → 失败 → catch → useJson.json 不变 → 第二层不触发
+    → 成功 → debouncedUpdateJson → useJson.json 更新 → 第二层触发
+```
+
+**是否经过第一层校验：✅ 是**
+
+[useFile.ts L100-L126](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L100-L126) 中 `setContents` 是唯一的数据通道，所有编辑器输入都经过 `contentToJson` 校验。无效内容在 catch 分支被拦截，`useJson.json` 永远不会更新为无效值。
+
+此外还有两个 `useJson.json` 的直接写入点：
+
+| 写入位置 | 代码 | 是否经过校验 |
+|---------|------|-------------|
+| `debouncedUpdateJson` | [useFile.ts L67-L69](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L67-L69): `useJson.getState().setJson(JSON.stringify(value, null, 2))` | ✅ 只有 contentToJson 成功才调用 |
+| `fetchUrl` 成功路径 | [useFile.ts L136](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L136): `useJson.setState({ json: jsonStr, loading: false })` | ✅ `res.json()` 本身会校验 |
+| `fetchUrl` 失败路径 | [useFile.ts L138](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L138): `get().clear()` | ✅ 清空操作 |
+
+**结论**：通过普通编辑器输入，**不可能**绕过第一层校验。第二层的语法错误路径在此入口下**不可达**。
+
+##### 入口 B：组件外部传入（VSCode 扩展 + Chrome 扩展）
+
+这两个入口**完全绕过了 `useFile` / `useJson` store 体系**，直接将数据传给 `JSONCrack` 组件的 `json` prop：
+
+**VSCode 扩展**：[App.tsx](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/vscode/src/App.tsx#L26-L42)
+
+```tsx
+const [json, setJson] = useState("{}");
+
+useEffect(() => {
+  const onMessage = (event: MessageEvent<{ json?: string }>) => {
+    const jsonData = event.data?.json;
+    if (typeof jsonData === "string") {
+      setJson(jsonData);              // ← 直接 setState，无任何校验
+    }
+  };
+  window.addEventListener("message", onMessage);
+}, []);
+
+<JSONCrack json={json} ... />         // ← 直接传入，不经过 contentToJson
+```
+
+**Chrome 扩展**：[content-script.tsx](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/chrome-extension/src/content-script.tsx#L304-L363)
+
+```tsx
+function GraphView({ rawJson }: { rawJson: string }) {
+  const parsedJson = useMemo(() => {
+    try {
+      return JSON.parse(rawJson);     // ← 只做了 JSON.parse 校验
+    } catch {
+      return null;                     // ← 解析失败直接显示错误提示
+    }
+  }, [rawJson]);
+
+  if (parsedJson === null) {
+    return <div>JSON parsing failed for graph mode.</div>;
+  }
+
+  return <JSONCrackComponent json={parsedJson} ... />;
+                                        // ← 传入的是已解析的对象
+                                        //   JSONCrack 内部会重新序列化+解析
+                                        //   到达第二层
+}
+```
+
+**是否经过第一层校验：❌ 否**（VSCode） / **⚠️ 部分**（Chrome 扩展做了 JSON.parse 但不是 contentToJson）
+
+| 入口 | 有无 useFile 校验 | 有无 contentToJson | 数据如何到达第二层 | 第二层语法错误可达性 |
+|------|------------------|-------------------|------------------|-------------------|
+| VSCode | ❌ 无 | ❌ 无 | `json` prop 直接传入字符串 → JSONCrack 内部 `toJsonText` → `parseJsonGraph` | ✅ **可达**：VSCode 传入无效字符串时，第二层会收到并处理 |
+| Chrome | ❌ 无 | ❌ 无 | `JSON.parse` 成功 → 对象传入 `json` prop → JSONCrack 内部 `toJsonText` 重新序列化 → `parseJsonGraph` | ⚠️ **部分可达**：JSON.parse 过滤了纯语法错误，但序列化后的字符串仍然会经过第二层解析 |
+
+> **注意**：Chrome 扩展的 `JSON.parse` 是简单校验，不是 `contentToJson`。它不能处理 YAML/XML/CSV，也不会做 jsonc-parser 的容错解析。如果 `JSON.parse` 成功，传入 `JSONCrack` 的是已经解析的对象，`toJsonText` 会重新序列化为标准 JSON 字符串，这种情况下 `parseTree` 几乎不可能再遇到语法错误。
+
+##### 入口 C：Widget 嵌入（iframe postMessage）
+
+[widget.tsx](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/pages/widget.tsx#L56-L74)
+
+```tsx
+React.useEffect(() => {
+  const handler = (event: EmbedMessage) => {
+    try {
+      if (!event.data?.json) return;
+      // ...主题处理...
+      setContents({ contents: event.data.json, hasChanges: false });
+      // ↑ 走的是 useFile.setContents，经过 contentToJson 校验
+    } catch (error) {
+      toast.error("Invalid JSON!");
+    }
+  };
+  window.addEventListener("message", handler);
+}, [setColorScheme, setContents, setDirection, toggleDarkMode, theme]);
+```
+
+**是否经过第一层校验：✅ 是**
+
+Widget 虽然通过 `postMessage` 接收外部数据，但最终调用了 `useFile.setContents`，和普通编辑器输入走同一条校验路径。无效内容同样会在 `contentToJson` 的 catch 分支被拦截。
+
+##### 三种入口的第二层可达性总结
+
+| 入口 | 代码位置 | 经过 contentToJson | 经过 useFile 校验 | 第二层语法错误可达性 | 原因 |
+|------|---------|-------------------|------------------|---------------------|------|
+| **A: 编辑器输入** | [TextEditor.tsx](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/features/editor/TextEditor.tsx#L90) | ✅ 是 | ✅ 是 | ❌ **不可达** | contentToJson 拦截所有无效内容，useJson.json 只接受有效值 |
+| **B: VSCode 扩展** | [vscode/App.tsx](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/vscode/src/App.tsx#L33) | ❌ 否 | ❌ 否 | ✅ **可达** | 直接 setJson → 传入 JSONCrack，无任何前置校验 |
+| **B: Chrome 扩展** | [content-script.tsx](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/chrome-extension/src/content-script.tsx#L329-L335) | ❌ 否 | ❌ 否 | ⚠️ **有限可达** | JSON.parse 过滤纯语法错误，但对象传入后仍经过第二层 |
+| **C: Widget iframe** | [widget.tsx](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/pages/widget.tsx#L65) | ✅ 是 | ✅ 是 | ❌ **不可达** | 走 setContents，与编辑器输入相同 |
+
+> **核心结论**：第二层语法错误路径（`kind: "ok"` + `syntaxErrorCount > 0`）在日常 www 主应用的编辑器中**不可达**。只有 **VSCode 扩展**直接传入未经校验的字符串时才可能触发，因为它是唯一完全绕过 `contentToJson` 且直接向 `JSONCrack` 输入原始字符串的入口。
 
 ---
 
@@ -676,7 +781,9 @@ type ParseJsonGraphResult =
 
 **用户输入无效内容时，`setContents` 的 catch 分支只更新 `useFile.error`（底部显示 Invalid），但绝不更新 `useJson.json`（画布数据源不变），因此画布保留上一次成功的图。这是设计使然，不是 bug。**
 
-### 9.2 三者状态映射全景表
+### 9.2 三者状态映射全景表（按入口分组）
+
+#### 入口 A：普通编辑器输入 / Widget postMessage（经过 contentToJson）
 
 | 场景 | contentToJson | useFile.error | BottomBar | useJson.json | 第二层是否触发 | 画布最终状态 |
 |------|--------------|---------------|-----------|-------------|---------------|-------------|
@@ -687,7 +794,23 @@ type ParseJsonGraphResult =
 | 无效 YAML/XML/CSV | ❌ 失败（catch） | null → error.mark.snippet 等 | Invalid（有Valid闪烁） | ❌ 不变 | 否 | **保留旧图** |
 | 空字符串 `""` | ✅ 返回 `{}`（特殊处理） | null | Valid | ✅ 更新为 `"{}"` | 是 | 单个空对象节点 |
 | 节点数超限（超大JSON） | ✅ 成功（contentToJson能解析） | null | Valid | ✅ 更新 | 是（above-limit） | 超限提示 + 空白 |
-| 直接 setJson("garbage") | —（绕过） | null（不变） | Valid（不变） | ✅ 更新 | 是 | 空白或部分图（第二层ok分支 + 空nodes） |
+
+#### 入口 B：VSCode 扩展 / Chrome 扩展（绕过 contentToJson）
+
+| 场景 | 前置校验 | 第二层结果 | 画布最终状态 | BottomBar |
+|------|---------|-----------|-------------|-----------|
+| VSCode 传入有效 JSON 字符串 | ❌ 无 | `kind: "ok"`, `syntaxErrorCount === 0` | 完整渲染 | 不存在（无 BottomBar） |
+| VSCode 传入无效 JSON 字符串 | ❌ 无 | `kind: "ok"`, `syntaxErrorCount > 0`, nodes 可能为空 | **空白或部分图**（第二层直接处理） | 不存在 |
+| Chrome 扩展页面有效 JSON | ✅ JSON.parse | `kind: "ok"`, `syntaxErrorCount === 0` | 完整渲染 | 不存在 |
+| Chrome 扩展页面无效 JSON | ✅ JSON.parse 拦截 | 不到达第二层 | 显示 "JSON parsing failed" 错误提示 | 不存在 |
+| Chrome 扩展页面超大 JSON | ✅ JSON.parse 通过 | `kind: "above-limit"` | 超限提示 | 不存在 |
+
+#### 对比要点
+
+- **入口 A**：无效输入 → 第一层拦截 → 保留旧图 + BottomBar Invalid（用户最常见体验）
+- **入口 B（VSCode）**：无效输入 → 无第一层 → 第二层直接处理 → 空白/部分图（无 BottomBar 提示）
+- **入口 B（Chrome）**：无效输入 → JSON.parse 拦截 → 显示错误文本（根本不渲染 JSONCrack）
+- **入口 C（Widget）**：与入口 A 相同（走 setContents）
 
 ### 9.3 最常见场景的时序：输入无效 JSON
 
