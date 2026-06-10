@@ -9,7 +9,9 @@
 | 结论 | 说明 |
 |------|------|
 | **无自定义 JSON 解析 Worker** | JSON 解析在主线程同步执行，使用 `jsonc-parser` |
-| **唯一 Worker 用于 ELK 布局** | 来自依赖库 `reaflow`，用于图形布局计算卸载 |
+| **唯一 Worker 用于 ELK 布局** | 来自依赖库 `reaflow` 内部调用 `elkjs`，使用原生 `new Worker()` 创建 |
+| **Worker 是模块级单例** | 整个页面共享一个 ELK Worker，多个 Canvas 组件复用同一实例 |
+| **组件卸载不终止 Worker** | `useLayout` 清理函数只取消 Promise，**不调用** `elk.terminateWorker()` |
 | **四个平台都用 JSONCrack 组件** | Web 编辑器、Widget 嵌入页、VS Code webview、Chrome 扩展 |
 | **内部 Worker ≠ 跨上下文通信** | Widget/VS Code 的 postMessage 是跨上下文通信，与内部布局 Worker 是两回事 |
 | **Chrome 扩展需禁用 Worker** | 因 CSP 限制，通过两层防护机制回退到同步模式 |
@@ -46,8 +48,8 @@
 ┌───────────────────────────────────────────────────────────────┐
 │                   reaflow Canvas 层                            │
 │  ┌─────────────────────────────────────────────────────────┐  │
-│  │                   ELK Layout Worker                     │  │
-│  │  (elkjs + web-worker，可选 — Chrome 扩展下被禁用)        │  │
+│  │             ELK Layout Worker（模块级单例）               │  │
+│  │  (elkjs 原生 new Worker()，可选 — Chrome 扩展下被禁用)   │  │
 │  └─────────────────────────────────────────────────────────┘  │
 └───────────────────────────────────────────────────────────────┘
 ```
@@ -74,18 +76,18 @@ jsoncrack-react
     ↓ (依赖)
 reaflow v5.4.1
     ↓ (依赖)
-elkjs v0.10.2 + web-worker v1.5.0
-    ↓ (运行时)
-ELK Layout Worker
+elkjs v0.10.2
+    ↓ (运行时，原生 Web Worker API)
+new Worker(elk-worker.min.js)   ← 注意：不使用 web-worker npm 包
 ```
 
 **依赖说明**：
 
 | 包 | 角色 |
 |----|------|
-| `reaflow` | React 流程图库，提供 `Canvas` 组件 |
-| `elkjs` | Eclipse Layout Kernel，布局算法核心 |
-| `web-worker` | Worker 池管理工具，封装 Worker 通信 |
+| `reaflow` | React 流程图库，提供 `Canvas` 组件和 `useLayout` Hook |
+| `elkjs` | Eclipse Layout Kernel，布局算法核心，自带 elk-api.js + elk-worker.js |
+| **原生 `new Worker()`** | elkjs 的 `workerFactory` 选项直接使用浏览器原生 Web Worker API，**不经过 `web-worker` npm 包** |
 
 ### 3.2 Worker 的用途
 
@@ -98,130 +100,198 @@ Web Worker 仅用于 **ELK 图形布局计算**，不涉及 JSON 解析。具体
 
 ### 3.3 任务分发机制
 
-#### 3.3.1 分发入口：JSONCrack 组件
+#### 3.3.1 分发入口：JSONCrack 组件 → reaflow Canvas → useLayout → elkLayout
 
-`JSONCrack` 组件本身不直接操作 Worker，而是通过 `reaflow` 的 `Canvas` 组件间接使用。
-
-**代码位置**：[JSONCrackComponent.tsx](file:///d:/fz/0601/solo-dogfeeding/code/184-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L585-L611)
-
-```tsx
-<Canvas
-  className="jsoncrack-canvas"
-  onLayoutChange={onLayoutChange}      // 布局完成回调
-  node={renderNode}
-  edge={renderEdge}
-  nodes={visibleNodes}                 // 输入：可见节点
-  edges={visibleEdges}                 // 输入：可见边
-  direction={layoutDirection}
-  layoutOptions={layoutOptions}
-  // ...
-/>
-```
-
-#### 3.3.2 分发流程
+`JSONCrack` 组件本身不直接操作 Worker。完整调用链：
 
 ```
-主线程 (React)                         Worker (ELK)
-    │                                     │
-    │ 1. nodes/edges 作为 props 传入       │
-    │    Canvas 组件                       │
-    │                                     │
-    │ 2. reaflow 内部调用 elkjs            │
-    │    ── postMessage(layoutTask) ─────►│
-    │                                     │
-    │                                     │ 3. ELK 算法计算布局
-    │                                     │    (分层布局算法)
-    │                                     │
-    │ 4. 布局结果返回                      │
-    │ ◄── postMessage(layoutResult) ──────│
-    │                                     │
-    │ 5. onLayoutChange 回调               │
-    │    更新 paneWidth/paneHeight         │
-    │    setLoading(false)                │
-    │                                     │
+JSONCrack 组件
+    ↓ (props: nodes, edges)
+reaflow <Canvas>
+    ↓ (内部调用)
+useLayout Hook (reaflow/src/layout/useLayout.ts)
+    ↓ (useEffect 中调用)
+elkLayout() 函数 (reaflow/src/layout/elkLayout.ts)
+    ↓ (调用单例 ELK 实例)
+elk.layout(graph)  →  elk-api.js 通过 postMessage 发送给 Worker
+    ↓
+Worker 中 elk-worker.js 执行布局算法
 ```
 
-#### 3.3.3 布局回调：结果回收
-
-**代码位置**：[JSONCrackComponent.tsx](file:///d:/fz/0601/solo-dogfeeding/code/184-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L401-L411)
+**代码位置**（reaflow 源码片段）：
 
 ```typescript
-const onLayoutChange = useCallback((layout: ElkRoot) => {
-  if (!layout.width || !layout.height) {
-    setLoading(false);
-    return;
-  }
-
-  layoutSizeRef.current = { width: layout.width, height: layout.height };
-  setPaneWidth(layout.width + 50);
-  setPaneHeight(layout.height + 50);
-  setLoading(false);  // 布局完成，取消加载状态
-}, []);
+// reaflow/src/layout/useLayout.ts — useEffect 分发布局
+useEffect(() => {
+    const promise = elkLayout(nodes, edges, {
+      'elk.direction': direction,
+      ...layoutOptions
+    });
+    promise
+      .then((result) => {
+        if (!isEqual(layout, result)) {
+          setLayout(result);
+          onLayoutChange(result);
+        }
+      })
+      .catch((err) => {
+        if (err.name !== 'CancelError') {
+          console.error('Layout Error:', err);
+        }
+      });
+    return () => promise.cancel();   // ⚠️ 注意：只 cancel Promise，不 terminate Worker
+  }, [nodes, edges]);
 ```
+
+```typescript
+// reaflow/src/layout/elkLayout.ts — 模块级单例 ELK 实例
+let elkInstance: ELK | null = null;    // 全局单例，所有 Canvas 共享
+
+const getElk = async () => {
+  if (elkInstance) return elkInstance;  // 复用已有实例
+
+  if (!isBrowser) {
+    // Node.js 环境：使用同步 bundled 版本
+    const ELKModule = await import('elkjs/lib/elk.bundled.js');
+    elkInstance = new ELKModule.default({ algorithms: ['layered'] });
+    return elkInstance;
+  } else {
+    // 浏览器环境：使用 elk-api + 原生 Worker
+    const ELKModule = await import('elkjs/lib/elk-api');
+    elkInstance = new ELKModule.default({
+      algorithms: ['layered'],
+      workerFactory: () => {
+        // ⚠️ 直接使用原生 new Worker()，不依赖 web-worker 包
+        const workerUrl = new URL('elkjs/lib/elk-worker.min.js', import.meta.url).href;
+        return new Worker(workerUrl);
+      }
+    });
+    return elkInstance;
+  }
+};
+```
+
+#### 3.3.2 Worker 单例复用策略
+
+`elkInstance` 是 `elkLayout.ts` 模块作用域内的变量（闭包单例），具有以下特性：
+
+| 特性 | 说明 |
+|------|------|
+| **首次创建** | 页面中任何一个 Canvas 组件首次调用 `elkLayout()` 时，通过 `getElk()` 创建 ELK 实例和 Worker |
+| **全局共享** | 同一页面中所有 `<Canvas>` 组件共享同一个 ELK 实例和同一个 Worker |
+| **跨组件复用** | 如果有多个 JSONCrack 组件（例如多标签页场景），它们会共用同一个 Worker |
+| **Node.js 环境** | 使用 `elk.bundled.js`（无 Worker），但同样是单例 |
+
+**重要**：Chrome 扩展禁用 Worker 的机制之所以有效，是因为它在 `import("jsoncrack-react")` 之前就将 `Worker` 置为 `undefined`，导致 `workerFactory` 中 `new Worker()` 检测失败，ELK 自动回退到同步模式。一旦 ELK 实例创建完毕（模式已确定），后续即使恢复 `globalThis.Worker` 也不会改变。
 
 ---
 
 ## 4. Worker 生命周期边界
 
+> **核心事实（与此前文档错误的修正）**：
+> reaflow 源码中的 `useLayout` useEffect 清理函数只调用 `promise.cancel()`，**从未调用** `elk.terminateWorker()`。
+> 组件卸载 **不会** 终止 ELK Worker。Worker 作为模块级单例，其生命周期与**整个页面**绑定，而非单个组件。
+
 ### 4.1 创建时机
 
-Worker 由 `reaflow` 内部的 `web-worker` 库管理，创建发生在：
+Worker 的创建由 `getElk()` 函数控制，关键触发条件：
 
-1. **`Canvas` 组件首次挂载**：组件挂载后首次需要布局时
-2. **懒加载创建**：`web-worker` 库在首次需要布局计算时才创建 Worker 实例
-3. **模块初始化时检测**：`elkjs` 在模块加载时检测 Worker 可用性，决定使用 Worker 模式还是同步模式
+1. **首次布局调用**：页面中**任何一个** `<Canvas>` 组件的 `useLayout` useEffect 首次执行时，调用 `elkLayout()` → `getElk()` 创建
+2. **懒加载创建**：通过 `await import('elkjs/lib/elk-api')` 动态导入 elk-api.js，随后立即在 `workerFactory` 中 `new Worker(...)` 创建 Worker
+3. **单例模式**：创建后写入模块级变量 `elkInstance`，后续所有布局复用此实例
+
+**实际创建条件**（必须同时满足）：
+- 浏览器环境：`typeof window !== 'undefined' && typeof Worker !== 'undefined'`
+  - 若 `Worker === undefined`（如 Chrome 扩展的 CSP 场景），`isBrowser` 判断为 `false`，回退到同步 bundled 模式
+  - 若浏览器原生不支持 Worker，同样回退
 
 ### 4.2 空闲状态
 
 布局计算完成后，Worker 进入空闲状态：
 
-- **状态**：Worker 保持运行，等待新的布局任务
-- **触发新任务**：当 `nodes` 或 `edges` 变化时，`reaflow` 重新布局，新任务被发送到 Worker
-- **触发场景**：
-  - JSON 数据变化 → 重新解析 → 新的 nodes/edges → 重新布局
+- **状态**：Worker 持续存活，等待接收新的 `layout` 消息
+- **触发新任务**：
+  - 任一 `<Canvas>` 的 `nodes`/`edges` props 变化 → useEffect 重新执行 → 发送新布局任务到**同一 Worker**
   - 折叠/展开节点 → visibleNodes 变化 → 重新布局
-  - 布局方向变化 → 重新布局
+  - 布局方向变化（Canvas key 变化触发组件卸载+重新挂载）→ 仍复用同一 Worker
+- **任务排队**：若前一布局未完成时发起新布局，`promise.cancel()` 会取消前一个 Promise（仅在主线程层面停止处理结果），但 Worker 中正在执行的计算**不会被中断**。新布局任务会在 Worker 空闲后继续处理。
 
 ### 4.3 销毁时机
 
-Worker 的销毁由 `reaflow` 内部管理，销毁时机：
+**Worker 的真实销毁条件**：
 
-1. **`Canvas` 组件卸载**：组件 `unmount` 时，`reaflow` 清理 Worker
-2. **页面关闭**：浏览器标签关闭时，所有 Worker 自动终止
-3. **无显式 terminate**：JSON Crack 代码中没有直接调用 `worker.terminate()`
+| 场景 | Worker 是否被终止 | 原因 |
+|------|------------------|------|
+| `<Canvas>` 组件卸载 | ❌ **不会** | `useLayout` 清理函数只 `promise.cancel()`，不调用 `elk.terminateWorker()` |
+| 多个 Canvas 逐个卸载 | ❌ **不会** | `elkInstance` 是模块变量，组件卸载不影响它 |
+| 同一页面内路由切换（React SPA） | ❌ **不一定** | 取决于是否卸载了所有 Canvas 组件 + 是否有代码显式调用 `terminateWorker`（reaflow 没有） |
+| **浏览器标签页关闭/刷新/跳转** | ✅ **会** | 浏览器回收整个 JS 上下文，Worker 随之终止 |
+| **热更新（HMR）重新加载模块** | ✅ **旧实例会** | 模块重新执行，`elkInstance` 变量重建，但旧 Worker 可能泄漏（取决于 bundler 实现） |
 
-### 4.4 生命周期状态机
+**为什么不终止？** 可能的设计考量：
+1. **Worker 创建代价高**：elk-worker.js 是 GWT 编译的 Java→JS 产物，体积大（数百 KB），初始化耗时较长
+2. **避免频繁创建销毁**：布局任务是高频操作（节点折叠、数据变化都会触发），复用 Worker 更好
+3. **单例全局复用**：如果同一页面有多个 Canvas（多标签编辑器等），共用同一个 Worker 更高效
+
+**但这也带来了潜在问题**：
+- 长期运行的 SPA 中，如果用户频繁进入/离开编辑器页面，Worker 会一直占用内存
+- Worker 内部可能存在的状态无法被重置
+- 没有提供暴露给外部的 Worker 清理接口
+
+### 4.4 各平台的销毁行为差异
+
+#### Web 编辑器（editor 页面）
+- 用户切换到其他页面（如 docs、converter、widget）：如果使用了客户端路由且 React 树没有卸载根节点，**Worker 仍存活**
+- 用户关闭标签页：Worker 销毁
+
+#### Widget 嵌入页
+- Widget 是独立 iframe，其 Worker 只存在于该 iframe 中
+- 父页面删除 `<iframe>` 元素 → iframe 上下文销毁 → Worker 销毁
+
+#### VS Code webview
+- webview panel 关闭 → VS Code 销毁 webview 整个渲染上下文 → Worker 销毁
+- 关闭 panel 时用户侧的清理（`onDidDispose`）仅清理 Node.js 侧监听器，不直接影响 Worker，但 webview 上下文整体销毁时 Worker 必然终止
+
+#### Chrome 扩展（同步模式，无 Worker）
+- 用户切换回 "Raw" 模式：`graphRoot.unmount()` → React 组件卸载 → 同步 ELK 实例被 GC 回收
+- 但 `elkInstance` 单例变量仍在 content script 模块作用域中，只有整页刷新时才真正重置
+
+### 4.5 生命周期状态机（修正版）
 
 ```
-            组件挂载
-               │
-               ▼
-         ┌───────────┐
-         │  未创建    │  Worker 尚未创建
-         └─────┬─────┘
-               │ 首次布局
-               ▼
-         ┌───────────┐
-         │  创建中    │  web-worker 初始化 Worker
-         └─────┬─────┘
-               │
-               ▼
-         ┌───────────┐
-   ┌────►│  运行中    │  处理布局任务
-   │     └─────┬─────┘
-   │           │
-   │ 布局完成   │ 新布局任务
-   │           ▼
-   │     ┌───────────┐
-   │     │  空闲中    │  等待新任务
-   │     └───────────┘
-   │
-   └──── 组件卸载
-         │
-         ▼
-   ┌───────────┐
-   │  已销毁    │  Worker 被终止
-   └───────────┘
+        页面加载 + 首次 Canvas 执行布局
+                       │
+                       ▼
+                  ┌───────────┐
+                  │  未创建    │  elkInstance = null
+                  └─────┬─────┘
+                        │ 首次 getElk()
+                        ▼
+                  ┌───────────┐
+                  │  创建中    │  动态 import elk-api
+                  │           │  workerFactory → new Worker()
+                  └─────┬─────┘
+                        │ elkInstance = <ELK实例>
+                        ▼
+                  ┌───────────┐
+            ┌────►│  运行中    │  处理布局任务（postMessage）
+            │     └─────┬─────┘
+            │           │
+  新布局任务 │ 布局完成   │ nodes/edges 变化
+            │           ▼
+            │     ┌───────────┐
+            │     │  空闲中    │  等待消息，持续存活
+            │     └───────────┘
+            │
+            └─── ✅ 仍有其他 Canvas，或同一 Canvas 继续使用
+
+╔══════════════════════════════════════════════════════════════╗
+║  ❌ 组件卸载：只 cancel Promise，Worker 不终止                 ║
+║      （仍处于空闲状态，elkInstance 仍在模块作用域）            ║
+╠══════════════════════════════════════════════════════════════╣
+║  ✅ 页面关闭 / 刷新 / iframe 销毁 / webview 销毁：              ║
+║      整个 JS 上下文销毁 → Worker 随之终止                      ║
+╚══════════════════════════════════════════════════════════════╝
 ```
 
 ---
@@ -334,7 +404,7 @@ const csp = [
 
 `worker-src` 指令允许从以下来源创建 Worker：
 - `${panel.webview.cspSource}`：webview 自身的源
-- `blob:`：Blob URL 创建的 Worker（`web-worker` 库常用方式）
+- `blob:`：Blob URL 创建的 Worker（elkjs workerFactory 的一种创建方式）
 - `data:`：Data URL 创建的 Worker
 
 #### 5.3.3 外部通信：VS Code Webview API
@@ -396,10 +466,10 @@ panel.onDidDispose(disposer, null, context.subscriptions);
 ```
 
 当 webview panel 关闭时：
-1. VS Code 销毁 webview 实例
-2. webview 中的 React 组件卸载
-3. `Canvas` 组件卸载 → 内部 ELK Worker 被清理
-4. 扩展端清理事件监听器
+1. VS Code 销毁 webview 实例（**整个渲染上下文销毁**）
+2. webview 中的 React 组件卸载（此时 `useLayout` 清理函数只 `promise.cancel()`，不 terminate Worker）
+3. **webview 的 JS 上下文整体销毁** → `elkInstance` 变量和 Worker 都被浏览器回收（不是显式 terminate，而是上下文销毁）
+4. 扩展端清理事件监听器（Node.js 侧）
 
 ### 5.4 Chrome 扩展
 
@@ -529,11 +599,12 @@ const unmountGraphView = () => {
 
 当用户切换回 "Raw" 模式时：
 1. React 组件卸载
-2. `Canvas` 组件卸载
-3. ELK 同步实例被清理
+2. `Canvas` 组件卸载 → `useLayout` 清理函数执行 `promise.cancel()`（如果有布局任务在进行）
+3. **`elkInstance` 变量仍保留在模块作用域**（作为单例，除非宿主页面刷新或 content script 重新注入，否则不会重置）
 4. DOM 容器清空
+5. 同步 ELK 实例中的算法对象理论上可以被 GC，但实际上 `elkInstance` 引用仍存在，直到页面刷新才真正释放
 
-（由于 Worker 被禁用，不存在 Worker 销毁的问题）
+（由于 Worker 被禁用，不存在 Worker 创建/销毁的问题，但同步 ELK 实例同样是模块级单例，不会随组件卸载而清除）
 
 ---
 
@@ -643,22 +714,38 @@ const debouncedUpdateJson = debounce((value: unknown) => {
 
 1. **JSON 解析在主线程同步执行**，使用 `jsonc-parser`，未使用 Worker 卸载
 
-2. **唯一的 Web Worker 是 ELK 布局 Worker**，来自 `reaflow` 依赖库，用于图形布局计算卸载
+2. **唯一的 Web Worker 是 ELK 布局 Worker**：
+   - 由 `reaflow` 内部的 `elkLayout()` 函数通过 `elkjs` 创建
+   - 使用原生 `new Worker()` API，**不依赖 `web-worker` npm 包**
+   - Worker 脚本为 `elkjs/lib/elk-worker.min.js`（GWT 编译的 Java→JS 产物）
 
-3. **四个平台的 JSONCrack 组件内部都有布局计算**，但 Chrome 扩展因 CSP 限制禁用 Worker 回退到同步模式
+3. **Worker 是模块级单例**：
+   - `let elkInstance: ELK | null = null` 定义在 `elkLayout.ts` 模块作用域中
+   - 同一页面中所有 `<Canvas>` 组件共享同一个 ELK 实例和同一个 Worker
+   - 跨组件复用，即使卸载了所有 Canvas 组件，Worker 仍存活
 
-4. **Widget 和 VS Code 的 postMessage 是跨上下文通信**，与内部布局 Worker 是两个独立的概念：
+4. **组件卸载 ❌ 不会终止 Worker**（此前文档的关键错误）：
+   - `useLayout` 的 useEffect 清理函数只调用 `promise.cancel()`
+   - **从未调用** `elk.terminateWorker()`（elkjs 提供了此 API 但 reaflow 未使用）
+   - Worker 只有在**整个 JS 上下文销毁**时才会终止（标签页关闭/刷新、iframe 移除、webview 销毁）
+
+5. **四个平台的 JSONCrack 组件内部都有布局计算**，但 Chrome 扩展因 CSP 限制禁用 Worker 回退到同步模式
+
+6. **Widget 和 VS Code 的 postMessage 是跨上下文通信**，与内部布局 Worker 是两个独立的概念：
    - Widget：`window.postMessage` 用于 iframe ↔ 父窗口通信
    - VS Code：`webview.postMessage` 用于扩展主机 ↔ webview 通信
    - 两者内部都各自运行着 ELK 布局 Worker
 
-5. **Chrome 扩展采用两层防护**禁用 Worker：
+7. **Chrome 扩展采用两层防护**禁用 Worker：
    - 构建时 banner 注入：`var Worker = undefined` 作用于 IIFE 作用域
    - 运行时全局禁用：`globalThis.Worker = undefined` 作用于动态导入模块
+   - 触发时机：`isBrowser = typeof Worker !== 'undefined'` 判断失败 → 走 `elk.bundled.js` 同步路径
    - 导入完成后立即恢复全局 Worker，不影响宿主页面
 
-6. **Worker 生命周期**：
-   - 创建：组件首次布局时由 `reaflow` 内部懒加载创建
-   - 空闲：布局完成后保持空闲，等待新任务
-   - 销毁：组件卸载时由 `reaflow` 内部清理
-   - 项目代码中无显式 `worker.terminate()` 调用
+8. **Worker 生命周期（修正后）**：
+   - ✅ **创建**：首次调用 `elkLayout()` 时通过 `getElk()` 懒加载创建
+   - ✅ **复用**：模块级单例，所有布局任务都发往同一个 Worker
+   - ✅ **空闲**：布局完成后持续存活，等待新的 `postMessage`
+   - ❌ **组件卸载**：只 `promise.cancel()`，Worker **不终止**
+   - ✅ **销毁**：页面关闭 / 上下文销毁（不是显式 terminate）
+   - 项目代码 + reaflow 源码中 **均无** 显式 `worker.terminate()` 调用
