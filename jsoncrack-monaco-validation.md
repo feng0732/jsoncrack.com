@@ -383,3 +383,214 @@ useGraph (画布交互状态)
   ├── selectedNode         ──→  NodeModal
   └── collapsedCount       ──→  (工具栏显示)
 ```
+
+---
+
+## 8. 无效输入时：内容解析失败、底部校验提示、画布保留旧图 三者关系
+
+这是理解"无效输入时画布是否刷新"的核心。三者的行为由 `useFile.setContents` 的 try/catch 结构、`useJson.json` 的更新条件、以及 `JSONCrack` 组件的解析策略共同决定。
+
+### 8.1 核心决策点：`useFile.setContents` 的 catch 分支
+
+[useFile.ts L100-L126](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L100-L126) 的 try/catch 结构是整个联动关系的枢纽：
+
+```ts
+setContents: async ({ contents, hasChanges = true, skipUpdate = false, format }) => {
+  try {
+    // ① 先清除错误状态 + 更新 contents
+    set({
+      ...(contents && { contents }),
+      error: null,              // ← 暂时标记为无错误
+      hasChanges,
+      format: format ?? get().format,
+    });
+
+    // ② 尝试解析内容
+    const json = await contentToJson(get().contents, get().format);
+
+    // ③ Live Transform 关闭且 skipUpdate → 不更新画布但也不报错
+    if (!useConfig.getState().liveTransformEnabled && skipUpdate) return;
+
+    // ...session 持久化...
+
+    // ④ 解析成功 → 更新画布数据源
+    debouncedUpdateJson(json);
+  } catch (error: any) {
+    // ⑤ 解析失败 → 只设置 error，不更新 useJson.json
+    if (error?.mark?.snippet) return set({ error: error.mark.snippet });
+    if (error?.message) set({ error: error.message });
+    useJson.setState({ loading: false });
+    // ⚠️ 注意：这里没有调用 debouncedUpdateJson！
+  }
+},
+```
+
+关键结论：
+- **catch 分支只设置 `error`，绝不会调用 `debouncedUpdateJson`**
+- **`useJson.json` 在解析失败时保持上一次成功解析的值不变**
+- 这就是"无效输入时画布保留旧图"的根本原因
+
+### 8.2 `contentToJson` 的容错策略（JSON 格式的特殊行为）
+
+[jsonAdapter.ts L4-L13](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/lib/utils/jsonAdapter.ts#L4-L13) 对 JSON 格式有一个特殊的两步解析策略：
+
+```ts
+if (format === FileFormat.JSON) {
+  const { parse } = await import("jsonc-parser");
+  const errors: ParseError[] = [];
+  const result = parse(value, errors);       // 第一步：jsonc-parser 容错解析
+  if (errors.length > 0) JSON.parse(value);  // 第二步：有错误则用标准 JSON.parse 抛异常
+  return result;
+}
+```
+
+这意味着：
+- `jsonc-parser.parse()` 本身是**容错的**，即使有语法错误也会尽力返回部分解析结果（不会抛异常）
+- 只有当 `errors.length > 0` 时，才会调用原生 `JSON.parse()` 刻意触发异常
+- 异常抛出后进入 `setContents` 的 catch 分支 → 设置 error + **不更新 useJson.json**
+
+### 8.3 画布保留旧图 vs 清空画布的完整条件矩阵
+
+画布内容由 `JSONCrack` 组件内部的 `nodes` 和 `edges` 两个 React state 决定。画布是否刷新取决于两层屏障：
+
+| 屏障层 | 位置 | 条件 | 画布行为 |
+|--------|------|------|---------|
+| **第一层：useJson.json 是否更新** | [useFile.ts catch 分支](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L121-L125) | `contentToJson` 解析失败 → catch 分支 | `useJson.json` **不变** → GraphView 不触发重新渲染 → **画布保留旧图** |
+| **第一层（续）** | [useFile.ts L120](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L120) | `contentToJson` 解析成功 + Live Transform 开启 → `debouncedUpdateJson` 被调用 | `useJson.json` **更新** → 进入第二层判断 |
+| **第一层（续）** | [useFile.ts L112](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L112) | `contentToJson` 解析成功 + Live Transform 关闭 + `skipUpdate=true` | 提前 return → `useJson.json` **不变** → **画布保留旧图** |
+| **第二层：JSONCrack 内部解析** | [JSONCrackComponent.tsx L170-L205](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L170-L205) | `parseJsonGraph` 返回 `kind: "error"` | `setNodes([]); setEdges([])` → **清空画布** |
+| **第二层（续）** | 同上 | `parseJsonGraph` 返回 `kind: "ok"` + `syntaxErrorCount > 0` | 仍然 `setNodes(graph.nodes); setEdges(graph.edges)` → **渲染部分图** |
+| **第二层（续）** | 同上 | `parseJsonGraph` 返回 `kind: "ok"` + `syntaxErrorCount === 0` | **完整渲染** |
+
+> **重要区分**：
+> - "保留旧图" = `useJson.json` 没变 → JSONCrack 组件的 `json` prop 没变 → 内部 `useEffect` 不触发 → nodes/edges 保持旧值
+> - "清空画布" = `useJson.json` 变了 → JSONCrack 重新解析 → 解析彻底失败 → setNodes([]), setEdges([])
+
+### 8.4 BottomBar 校验提示的错误来源与时序
+
+[BottomBar.tsx L112-L131](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/features/editor/BottomBar.tsx#L112-L131) 的显示逻辑很简单：
+
+```tsx
+{error ? (
+  // 红色 VscError + "Invalid" + Popover 显示 error 内容
+) : (
+  // 绿色 VscCheck + "Valid"
+)}
+```
+
+但 `useFile.error` 的写入有三个独立来源，时序互相穿插：
+
+| 写入来源 | 代码位置 | 写入值 | 触发时机 | 异步/同步 |
+|----------|---------|--------|---------|-----------|
+| **A: setContents try 块入口** | [useFile.ts L102-L107](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L102-L107) | `error: null` | 每次 `setContents` 被调用时（每次按键） | 同步 |
+| **B: setContents catch 块** | [useFile.ts L121-L125](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L121-L125) | `error.mark.snippet` 或 `error.message` | `contentToJson` 解析失败时 | 异步（await contentToJson 后） |
+| **C: Monaco onValidate 回调** | [TextEditor.tsx L89](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/features/editor/TextEditor.tsx#L89) | `errors[0]?.message \|\| ""` | Monaco 语言服务校验完成时 | 异步（Monaco 内部调度，延迟不确定） |
+
+典型时序（用户输入无效 JSON `{bad`）：
+
+```
+T0: 用户按下按键
+     ├─ Monaco onChange 同步触发 → setContents({ contents: "{bad", skipUpdate: true })
+     │    ├─ A: 同步 set({ error: null, contents: "{bad" })
+     │    │      → BottomBar 瞬时显示 "Valid"（闪烁）
+     │    └─ B: 异步 await contentToJson("{bad}", "json")
+     │          → jsonc-parser 容错返回部分结果，但 errors.length > 0
+     │          → JSON.parse("{bad}") 抛 SyntaxError
+     │          → catch: set({ error: "Unexpected token..." })
+     │          → BottomBar 显示 "Invalid"
+     │          → ⚠️ useJson.json 保持不变 → 画布保留旧图
+     │
+     └─ C: Monaco onValidate 稍后异步回调
+          → setError("Expected ':'...")  ← 可能覆盖 B 设置的错误消息
+          → BottomBar 仍显示 "Invalid"（消息内容可能变化）
+```
+
+典型时序（用户修正为有效 JSON `{"a":1}`）：
+
+```
+T0: 用户按下按键
+     ├─ setContents({ contents: '{"a":1}', skipUpdate: true })
+     │    ├─ A: 同步 set({ error: null, ... })
+     │    │      → BottomBar 显示 "Valid"
+     │    └─ B: contentToJson 成功 → { a: 1 }
+     │          → debouncedUpdateJson({ a: 1 })  (400ms 防抖)
+     │          → 400ms 后 useJson.json = '{\n  "a": 1\n}'
+     │          → JSONCrack 重新解析 → 画布刷新
+     │
+     └─ C: Monaco onValidate 回调 → setError("")  ← 空字符串也是 falsy
+          → BottomBar 仍显示 "Valid"
+```
+
+### 8.5 四种典型场景下三者的联动表
+
+| 场景 | contentToJson 结果 | useFile.error | useJson.json | BottomBar 显示 | 画布行为 |
+|------|-------------------|---------------|--------------|---------------|---------|
+| **有效 JSON + Live 开启** | 成功 → `{...}` | `null`（try 块设置），随后 Monaco 返回 `""` | 更新（400ms 后） | Valid | 刷新为新图 |
+| **无效 JSON** | 失败（catch） | 先 `null`（闪烁），后被 catch 设为错误消息，再可能被 Monaco 覆盖 | **不变** | Invalid（瞬时 Valid 闪烁） | **保留旧图** |
+| **有效 JSON + Live 关闭 + skipUpdate** | 成功 → `{...}` | `null` | **不变**（被 L112 return 拦截） | Valid | **保留旧图**（直到点 Click to Transform） |
+| **有效 YAML + Monaco 无 YAML 校验** | 成功 → `{...}` | `null`（Monaco 可能也返回 `""`） | 更新（400ms 后） | Valid | 刷新为新图 |
+| **无效 YAML** | 失败（catch） | catch 设置 `error.mark.snippet`（YAML js-yaml 的错误格式） | **不变** | Invalid | **保留旧图** |
+| **空内容 `""`** | contentToJson 返回 `{}`（L5：`if (!value) return {}`） | `null` | 更新为 `"{}"` | Valid | 刷新为空对象图 |
+
+### 8.6 一个容易混淆的边界：空字符串
+
+[jsonAdapter.ts L5](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/lib/utils/jsonAdapter.ts#L5) 的特殊处理：
+
+```ts
+export const contentToJson = async (value: string, format = FileFormat.JSON): Promise<object> => {
+  if (!value) return {};  // ← 空字符串不抛异常，返回空对象
+  // ...
+};
+```
+
+当编辑器内容被清空时：
+- `contentToJson("")` 返回 `{}`，不会进 catch
+- `useFile.error` 被设为 `null` → BottomBar 显示 Valid
+- `debouncedUpdateJson({})` 被调用 → `useJson.json = "{}"` → 画布刷新为一个空对象节点
+
+这解释了为什么"删除所有内容"会让画布变成单个空对象节点，而不是保留旧图。
+
+### 8.7 另一个边界：第二层清空画布的触发条件
+
+第一层屏障（`useJson.json` 不变）通常已经阻止了无效输入到达画布。但在以下特殊情况下，第二层屏障也会触发：
+
+1. **手动通过 API 直接设置 `useJson.setJson("invalid")`**（绕过了 useFile 的校验）
+2. **`contentToJson` 成功但 `jsonc-parser.parseTree` 完全无法构建 AST**：
+   - `parseTree` 返回 `null` → `parseGraph` 返回 `{ nodes: [], edges: [], errors: [...] }`
+   - `parseJsonGraph` 返回 `{ kind: "ok", graph: {nodes:[], edges:[]}, syntaxErrorCount: N }`
+   - 由于 `kind` 不是 "error"，JSONCrack 会执行 `setNodes([])` + `setEdges([])` → **画布清空（但显示空白，不是保留旧图）**
+
+注意 `parseGraph` 返回空数组时，JSONCrack 走的是 `kind: "ok"` 分支（不是 `kind: "error"`），所以不会调用 `onParseError`，只会把 nodes/edges 设为空数组。
+
+---
+
+## 9. 总结：三者关系的本质
+
+```
+                    ┌─────────────────────────────┐
+                    │   用户输入无效内容            │
+                    └─────────────┬───────────────┘
+                                  │
+                                  ▼
+              ┌───────────────────────────────────────┐
+              │  setContents try {                     │
+              │    ① error = null   (BottomBar 瞬时Valid)│
+              │    ② contentToJson → 抛异常            │
+              │  } catch {                              │
+              │    ③ error = "错误消息" (BottomBar Invalid)│
+              │    ④ ⚠️ 不调用 debouncedUpdateJson       │
+              │  }                                      │
+              └───────────────┬────────────────────────┘
+                              │
+              ┌───────────────┴────────────────────────┐
+              │                                        │
+              ▼                                        ▼
+    useFile.error 被设置                      useJson.json 保持不变
+    → BottomBar 显示 Invalid                  → GraphView 不重渲染
+                                              → JSONCrack 的 json prop 不变
+                                              → 内部 useEffect 不触发
+                                              → nodes/edges 保留旧值
+                                              → ✅ 画布保留旧图
+```
+
+一句话概括：**内容解析失败时，catch 分支只更新 error（影响 BottomBar），但绝不更新 useJson.json（影响画布），这就是底部显示 Invalid 但画布仍显示旧图的设计原理。**
