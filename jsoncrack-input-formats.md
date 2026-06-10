@@ -86,15 +86,15 @@ export enum FileFormat {
 | 5 | SessionStorage 恢复 | 页面刷新 | 之前保存的任意格式 | `apps/www/src/store/useFile.ts#L142-L154` |
 | 6 | Widget iframe postMessage | 父页面 `postMessage({ json })` | JSON 字符串 | `apps/www/src/pages/widget.tsx#L57-L75` |
 
-### 2.2 VSCode 扩展入口（3 条命令）
+### 2.2 VSCode 扩展入口（3 条命令，三者发送策略完全不同）
 
-扩展在 `apps/vscode/package.json#L29-L76` 注册了 3 个命令，全部在 `apps/vscode/ext-src/extension.ts#L12-L23` 的 `activate()` 中绑定：
+扩展在 `apps/vscode/package.json#L29-L76` 注册了 3 个命令，全部在 `apps/vscode/ext-src/extension.ts#L12-L23` 的 `activate()` 中绑定。**三条命令的发送时机、握手、变更监听策略各不相同，不得混淆**：
 
-| 命令 ID | 菜单位置 | 含义 | 对应函数 |
-|---------|---------|------|---------|
-| `jsoncrack-vscode.start` | 编辑器标题栏（仅 `.json` / langId=json） | 可视化**整个活动文档** | `createWebviewForActiveEditor()` `apps/vscode/ext-src/extension.ts#L67-L93` |
-| `jsoncrack-vscode.start.selected` | 右键上下文菜单（`editorHasSelection`） | 可视化**选中的文本片段** | `createWebviewForSelectedText()` `apps/vscode/ext-src/extension.ts#L27-L65` |
-| `jsoncrack-vscode.start.specific` | 仅命令面板（其他扩展调用） | 可视化**编程传入的指定字符串** | `createWebviewForContent()` `apps/vscode/ext-src/extension.ts#L100-L110` |
+| 命令 ID | 菜单位置 | 含义 | 对应函数 | 核心差异 |
+|---------|---------|------|---------|---------|
+| `jsoncrack-vscode.start` | 编辑器标题栏（仅 `.json` / langId=json） | 可视化**整个活动文档** | `createWebviewForActiveEditor()` `apps/vscode/ext-src/extension.ts#L67-L93` | 仅 ready 握手推送 + 实时同步**完整文档**，无创建后即时发送 |
+| `jsoncrack-vscode.start.selected` | 右键上下文菜单（`editorHasSelection`） | 可视化**选中的文本片段** | `createWebviewForSelectedText()` `apps/vscode/ext-src/extension.ts#L27-L65` | 创建后**立即**发 + ready 补发 + 实时同步**当前选区切片**，**有前置校验** |
+| `jsoncrack-vscode.start.specific` | 仅命令面板（其他扩展编程调用） | 可视化**编程传入的指定字符串** | `createWebviewForContent()` `apps/vscode/ext-src/extension.ts#L100-L110` | **仅创建后发一次**，无 ready 握手，无变更监听，**纯一次性展示** |
 
 ### 2.3 Chrome 扩展入口
 
@@ -344,91 +344,164 @@ vscode.window.createWebviewPanel("liveHTMLPreviewer", title, ViewColumn.Beside, 
   └─ 返回 panel 实例，调用方通过 panel.webview.postMessage 传数据
 ```
 
-#### 4.1.3 命令 1：可视化**整个活动文档**
+#### 4.1.3 命令 1：`jsoncrack-vscode.start` — 可视化**整个活动文档**
+**代码位置**：`apps/vscode/ext-src/extension.ts#L67-L93`
 
-`apps/vscode/ext-src/extension.ts#L67-L93`：
+> **独特策略**：**只做 ready 握手 + 实时同步完整文档**，不做面板创建后的即时推送。
+>
+> 这是三者中**唯一**在面板创建后不立即发消息的命令。它完全依赖 Webview 侧的 `ready` 回包来触发首屏数据。
 
 ```
 createWebviewForActiveEditor(context)
   │
-  ├─ editor = vscode.window.activeTextEditor
-  ├─ panel  = createWebviewPanel(context, getPanelTitle(editor.document))
+  ├─ 数据获取
+  │    editor = vscode.window.activeTextEditor
+  │    → 数据范围 = editor.document.getText()   ← 整个文档全文
   │
-  ├─ ① "ready" 握手 → 立刻推送全文档
+  ├─ panel = createWebviewPanel(context, title)
+  │
+  ├─ ① 发送时机：**仅 ready 握手触发**（L71-L77）
   │    panel.webview.onDidReceiveMessage(e)
-  │      if e === "ready" → panel.webview.postMessage({ json: editor.document.getText() })
+  │      if e === "ready"
+  │        → panel.webview.postMessage({
+  │             json: editor?.document.getText()     ← 每次都重新拉取全文
+  │           })
   │
-  ├─ ② 文档变更 → 实时同步
+  ├─ ② 变更监听：**有，完整文档同步**（L79-L85）
   │    vscode.workspace.onDidChangeTextDocument(changeEvent)
   │      if changeEvent.document === editor.document
-  │        → panel.webview.postMessage({ json: changeEvent.document.getText() })
+  │        → panel.webview.postMessage({
+  │             json: changeEvent.document.getText()  ← 变更后推送全文
+  │           })
   │
-  └─ panel.onDidDispose → dispose 掉两个监听器
+  └─ ③ 监听器：onReceiveMessage + onTextChange，共 2 个（L87-L92）
+      panel.onDidDispose → dispose 两个监听器
 ```
 
-#### 4.1.4 命令 2：可视化**选中文本**
+**无**：创建后即时发送、前置校验。
 
-`apps/vscode/ext-src/extension.ts#L27-L65`：
+---
+
+#### 4.1.4 命令 2：`jsoncrack-vscode.start.selected` — 可视化**选中的文本片段**
+**代码位置**：`apps/vscode/ext-src/extension.ts#L27-L65`
+
+> **独特策略**：**创建后立即发送 + ready 补发 + 变更时重取选区切片**，且**有前置校验**。
+>
+> 这是三者中**唯一**有前置校验的命令，也是**唯一**在面板创建后立刻发一次消息的命令。变更时也不是推送全文，而是**重新对当前选区切片**。
 
 ```
 createWebviewForSelectedText(context)
   │
-  ├─ 前置校验: editor.selection.isEmpty → 提示 "Please select some text first!" 并 return
+  ├─ 前置校验（L30-L33）—— 三者中【唯一】有
+  │    if editor.selection.isEmpty
+  │      → vscode.window.showInformationMessage("Please select some text first!")
+  │      → return  （不创建面板）
   │
-  ├─ selectedText = editor.document.getText(editor.selection)
+  ├─ 数据获取
+  │    selectedText = editor.document.getText(editor.selection)
+  │    → 数据范围 = 当前选中的文本片段
   │
   ├─ panel = createWebviewPanel(...)
   │
-  ├─ ① 创建面板后立刻发送一次
+  ├─ ① 发送时机 1：**创建后立即发一次**（L39-L41）—— 三者中【唯一】
   │    panel.webview.postMessage({ json: selectedText })
   │
-  ├─ ② 握手 ready → 补发（防止 Webview 晚于消息准备好）
-  │    onDidReceiveMessage e === "ready"
-  │      → panel.webview.postMessage({ json: selectedText })
+  ├─ ② 发送时机 2：**ready 握手补发**（L43-L49）
+  │    panel.webview.onDidReceiveMessage(e)
+  │      if e === "ready"
+  │        → panel.webview.postMessage({ json: selectedText })
   │
-  ├─ ③ 文档变更 → 仅取当前选区重新切片
-  │    onDidChangeTextDocument → 仅当是同一文档
-  │      → panel.webview.postMessage({ json: document.getText(editor.selection) })
+  ├─ ③ 变更监听：**有，但重新对选区切片**（L51-L57）
+  │    vscode.workspace.onDidChangeTextDocument(changeEvent)
+  │      if changeEvent.document === editor?.document
+  │        → panel.webview.postMessage({
+  │             json: changeEvent.document.getText(editor?.selection)
+  │                                                    ↑ 不是全文！是当前选区
+  │           })
   │
-  └─ onDidDispose → dispose
+  └─ ④ 监听器：onReceiveMessage + onTextChange，共 2 个（L59-L64）
+      panel.onDidDispose → dispose 两个监听器
 ```
 
-#### 4.1.5 命令 3：可视化**指定内容字符串**（供其他扩展调用）
+**无**：文档级别全文同步（始终走选区切片）。
 
-`apps/vscode/ext-src/extension.ts#L95-L110`：
+---
+
+#### 4.1.5 命令 3：`jsoncrack-vscode.start.specific` — 可视化**编程传入的指定字符串**
+**代码位置**：`apps/vscode/ext-src/extension.ts#L100-L110`
+
+> **独特策略**：**只在创建后发一次**，无 ready 握手，无变更监听，**纯一次性展示**。
+>
+> 这是三者中**唯一**没有任何监听器的命令。它面向其他扩展的编程调用，假定调用方自己管理内容同步。
 
 ```ts
+/**
+ * Renders a readonly diagram from a string
+ * @param context ExtensionContext
+ * @param content JSON content as a string
+ */
 function createWebviewForContent(context?: ExtensionContext, content?: string): any {
   if (context && content) {
-    const panel = createWebviewPanel(context, title);
-    panel.webview.postMessage({ json: content });   // 一次性推送，无监听
+    const panel = createWebviewPanel(
+      context,
+      getPanelTitle(vscode.window.activeTextEditor?.document)
+    );
+
+    // ── ① 发送时机：创建后发一次，且仅此一次 ──
+    panel.webview.postMessage({ json: content });
+
+    // ── ② 无 ready 握手监听 ──
+    // ── ③ 无 onDidChangeTextDocument 变更监听 ──
+    // ── ④ 无 onDidDispose 清理（无监听器可 dispose）──
   }
 }
 ```
 
-> 注意：该命令不带 ready 握手和变更监听，适合一次性展示。
+**无**：ready 握手、变更监听、前置校验。
+
+---
 
 #### 4.1.6 Webview 侧（React App）收消息并接入统一链路
 
-`apps/vscode/src/App.tsx#L21-L56`：
+**代码位置**：`apps/vscode/src/App.tsx#L21-L56`
+
+> 无论三条命令发送策略如何不同，Webview 侧的接收逻辑是**同一套**：只要收到 `event.data.json` 为字符串，就更新 state 并驱动 `<JSONCrack>` 渲染。
 
 ```
 <App />
   │
   ├─ 初始 state: json = "{}"
   │
-  ├─ useEffect: 建立通道
+  ├─ useEffect: 建立通道（L26-L41）
   │   vscode = window.acquireVsCodeApi?.()
-  │   vscode.postMessage("ready")                       ← 握手：告诉宿主「我已就绪」
+  │   vscode.postMessage("ready")                       ← 告诉宿主「我已就绪」
   │   window.addEventListener("message", onMessage)
   │     onMessage(event)
   │       if (typeof event.data?.json === "string")
   │         setJson(event.data.json)                      ← 写入 React state
   │
-  └─ 渲染 <JSONCrack json={json} theme={getTheme()} ... />
+  └─ 渲染 <JSONCrack json={json} theme={getTheme()} ... />  （L56）
        │
-       └─ 与 Web 主程序相同：toJsonText → parseJsonGraph → parseGraph → 渲染
+       └─ 与 Web 主程序完全相同的统一链路：
+          toJsonText → parseJsonGraph → parseGraph → 渲染
 ```
+
+---
+
+#### 4.1.7 三条命令发送策略对比总表
+
+| 对比维度 | `createWebviewForActiveEditor` (`.start`) | `createWebviewForSelectedText` (`.start.selected`) | `createWebviewForContent` (`.start.specific`) |
+|---------|-------------------------------------------|---------------------------------------------------|----------------------------------------------|
+| **代码位置** | `apps/vscode/ext-src/extension.ts#L67-L93` | `apps/vscode/ext-src/extension.ts#L27-L65` | `apps/vscode/ext-src/extension.ts#L100-L110` |
+| **触发入口** | 编辑器标题栏图标（仅 `.json` / langId=json） | 右键上下文菜单（`editorHasSelection`） | 仅命令面板，供其他扩展编程调用 |
+| **数据范围** | `editor.document.getText()` — 完整文档 | `document.getText(editor.selection)` — 当前选区 | 函数参数 `content` — 调用方传入 |
+| **前置校验** | ❌ 无 | ✅ 有（`selection.isEmpty` 则提示并 return） | ❌ 无（仅检查 `context && content`） |
+| **面板创建后立即发送** | ❌ 无 | ✅ 有（`panel.postMessage({ json: selectedText })` L39-L41） | ✅ 有（且仅此一次，L106-L108） |
+| **ready 握手** | ✅ 有（L71-L77） | ✅ 有（L43-L49） | ❌ 无 |
+| **变更监听** | ✅ 有，同步**完整文档**（L79-L85） | ✅ 有，同步**当前选区切片**（L51-L57） | ❌ 无 |
+| **监听器数量** | 2 个（onReceiveMessage + onTextChange） | 2 个（onReceiveMessage + onTextChange） | 0 个 |
+| **发送时机数量** | 2 次（ready + 每次变更） | 3 次（创建后 + ready + 每次变更） | 1 次（仅创建后） |
+| **适用场景** | 打开整个 JSON 文件实时联动 | 临时查看某段 JSON 片段 | 其他扩展一次性传入内容展示 |
 
 ### 4.2 Chrome 扩展：JSON 响应页面自动捕获 + Raw/Graph 切换
 
@@ -507,54 +580,100 @@ GraphView({ rawJson })
 
 ---
 
-## 5. Chrome 扩展与 VSCode 扩展链路汇总
+## 5. Chrome 扩展与 VSCode 扩展链路汇总（含 VSCode 三命令差异）
+
+### 5.1 VSCode 三条命令各自的独立链路
 
 ```
-VSCode 扩展宿主 (ext-src/extension.ts)
-│
-├─ jsoncrack-vscode.start
-│    activeTextEditor.document.getText()
-│    └─ ready 握手 + onDidChangeTextDocument 持续同步
-│
-├─ jsoncrack-vscode.start.selected
-│    activeTextEditor.document.getText(editor.selection)
-│    └─ ready 握手 + onDidChangeTextDocument(重取选区) 持续同步
-│
-└─ jsoncrack-vscode.start.specific(content)
-     传入的任意字符串
-     └─ 单次 postMessage({ json: content })
-     │
-     ▼
-   createWebviewPanel(webview.ts)  ← 构造带 CSP 的 HTML，加载 index.js
-     │
-     ▼
-   VSCode Webview 端 (vscode/src/App.tsx)
-     window.addEventListener("message") → setJson(str)
-     └─ <JSONCrack json={str}/>
-          │
-          ▼
-        统一链路 (packages/jsoncrack-react)
-          toJsonText → parseJsonGraph → parseGraph → reaflow Canvas
+┌────────────────────────────────────────────────────────────────────────────┐
+│  VSCode 扩展宿主 (apps/vscode/ext-src/extension.ts)                         │
+│                                                                            │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ jsoncrack-vscode.start (L67-L93) — 整个活动文档                      │  │
+│  │                                                                    │  │
+│  │  • 数据: editor.document.getText()  [完整文档]                      │  │
+│  │  • 发送时机: 仅 ready 握手触发 + 每次变更全文推送                    │  │
+│  │  • ✅ ready 握手    ✅ 变更监听(全文)    ❌ 创建后立即发  ❌ 前置校验 │  │
+│  └──────────────────────────────┬───────────────────────────────────────┘  │
+│                                 │ postMessage({ json: fullText })         │
+│  ┌──────────────────────────────────┼──────────────────────────────────────┐  │
+│  │ jsoncrack-vscode.start.selected (L27-L65) — 选中文本                 │  │
+│  │                                    │                                 │  │
+│  │  • 前置校验: selection.isEmpty → 提示 return  [三者唯一]              │  │
+│  │  • 数据: document.getText(editor.selection)  [选区切片]               │  │
+│  │  • 发送时机: 创建后立即发 + ready 补发 + 每次变更重取切片 [三者唯一]   │  │
+│  │  • ✅ ready 握手    ✅ 变更监听(选区)    ✅ 创建后立即发  ✅ 前置校验   │  │
+│  └──────────────────────────────┬───────────────────────────────────────┘  │
+│                                 │ postMessage({ json: selectedText })     │
+│  ┌──────────────────────────────────┼──────────────────────────────────────┐  │
+│  │ jsoncrack-vscode.start.specific (L100-L110) — 指定内容               │  │
+│  │                                    │                                 │  │
+│  │  • 数据: 函数参数 content  [调用方传入]                               │  │
+│  │  • 发送时机: 仅创建后发一次  [三者唯一]                               │  │
+│  │  • ❌ ready 握手    ❌ 变更监听        ✅ 创建后立即发  ❌ 前置校验   │  │
+│  └──────────────────────────────┬───────────────────────────────────────┘  │
+│                                 │ postMessage({ json: content })          │
+└─────────────────────────────────┼──────────────────────────────────────────┘
+                                  │
+                                  ▼
+                       createWebviewPanel(webview.ts)
+                         • 构造带 CSP 的 HTML
+                         • 加载 index.js (React App)
+                                  │
+                                  ▼
+                  ┌──────────────────────────────────────┐
+                  │  VSCode Webview 端 (src/App.tsx)     │
+                  │  【接收逻辑三者共用同一套】          │
+                  │                                      │
+                  │  useEffect:                          │
+                  │    vscode.postMessage("ready")       │
+                  │    window.onmessage →                │
+                  │      if (data.json is string)        │
+                  │        setJson(data.json)            │
+                  │                                      │
+                  │  <JSONCrack json={json} />           │
+                  └──────────────────┬───────────────────┘
+                                     │
+                                     ▼
+                          统一链路 (packages/jsoncrack-react)
+                            toJsonText → parseJsonGraph → parseGraph → reaflow Canvas
+```
 
+### 5.2 Chrome 扩展链路
 
-Chrome 扩展宿主 (content-script.tsx)
+```
+Chrome 扩展宿主 (apps/chrome-extension/src/content-script.tsx)
 │
-├─ document_idle 触发 → getJsonSource()
-│     contentType 含 json → body.innerText → JSON.parse() 校验
-│     │
-│     ▼
-│   injectToggle(rawJson) → Raw / Graph 分段按钮
-│     │
-│     ▼
-│   GraphView({ rawJson })
-│     parsedJson = JSON.parse(rawJson)
-│     │
-│     ▼
-│   <JSONCrackComponent json={parsedJson}/>   ← object 类型
-│     │
-│     ▼
-   统一链路 (packages/jsoncrack-react)
-     toJsonText → JSON.stringify(WeakMap 缓存) → parseJsonGraph → parseGraph → reaflow Canvas
+├─ manifest (public/manifest.json):
+│     matches: "<all_urls>"
+│     run_at: "document_idle"
+│
+├─ IIFE 启动 (L52-L64)
+│     if (window.top !== window) return          // 不注入 iframe
+│     if (document.getElementById(TOGGLE_ID)) return  // 不重复注入
+│
+├─ getJsonSource() (L71-L84) — 三层过滤
+│     ① contentType 含 "json"?
+│     ② body.innerText 非空?
+│     ③ JSON.parse() 解析合法?
+│     → 返回合法 JSON 字符串 rawJson
+│
+├─ injectStyles()  injectToggle(rawJson)
+│     → Raw / Graph 切换按钮注入页面
+│
+└─ 用户点击 "Graph" → GraphView({ rawJson }) (L300-L363)
+       │
+       ├─ loadJsonCrackComponent() (L28-L50)
+       │    → 临时 shadow Worker → 导入 jsoncrack-react → 恢复 Worker
+       │       [规避严格 CSP]
+       │
+       ├─ parsedJson = JSON.parse(rawJson)
+       │
+       └─ <JSONCrackComponent json={parsedJson} />   ← object 类型
+            │
+            └─ toJsonText(parsedJson)
+                 → WeakMap 缓存命中 → JSON.stringify
+                 → parseJsonGraph → parseGraph → 渲染
 ```
 
 ---
@@ -592,8 +711,12 @@ setFormat(newFormat)                    apps/www/src/store/useFile.ts#L86-L98
                          │  ┌──────────────────────────────────────┐  │
                          │  │ VSCode Extension Host (ext-src/)      │  │
                          │  │  .start   → active editor full text  │  │
+                         │  │             [ready 握手 + 全文同步]   │  │
                          │  │  .selected→ selection slice          │  │
+                         │  │             [前置校验 + 创建后立即发 + │  │
+                         │  │              ready 补发 + 选区重切片] │  │
                          │  │  .specific→ caller-provided content  │  │
+                         │  │             [仅创建后发一次，无监听] │  │
                          │  └──────────┬───────────────────────────┘  │
                          │             │ postMessage({ json })        │
                          │  ┌──────────┴───────────────────────────┐  │
@@ -678,7 +801,11 @@ setFormat(newFormat)                    apps/www/src/store/useFile.ts#L86-L98
 3. **容错 JSON 解析**：核心 `parseGraph()` 使用 `jsonc-parser` 的 `parseTree()`，容忍 JSON 中的注释和尾逗号；单元测试 `packages/jsoncrack-react/src/__tests__/parser.test.ts#L95-L99` 验证了此特性。
 4. **防抖更新**：编辑器输入经 400ms 防抖后写入 `useJson`（`apps/www/src/store/useFile.ts#L67-L69`），避免频繁重绘。
 5. **会话恢复**：`sessionStorage` 同时保存 `contents`（原始格式文本）和 `format`，刷新后 `checkEditorSession()` 正确恢复并重新走完整链路（`apps/www/src/store/useFile.ts#L142-L154`）。
-6. **VSCode 三段式发送**：宿主扩展在「创建后」和「ready 握手后」各发一次 `postMessage`，加上 `onDidChangeTextDocument` 持续同步，保证 Webview 晚启动也能收到全量数据。
+6. **VSCode 三命令策略各异，不得混淆**：
+   - `createWebviewForActiveEditor`（`.start`）：**仅 ready 握手 + 变更时全文同步**，无创建后即时发送，无前置校验（`apps/vscode/ext-src/extension.ts#L67-L93`）
+   - `createWebviewForSelectedText`（`.start.selected`）：**唯一**有前置校验（`selection.isEmpty` 则提示并 return），**唯一**创建后立即发送，**唯一**变更时重取选区切片而非全文（`apps/vscode/ext-src/extension.ts#L27-L65`）
+   - `createWebviewForContent`（`.start.specific`）：**唯一**无任何监听器（无 ready 握手、无变更监听），仅创建后发一次，纯一次性展示（`apps/vscode/ext-src/extension.ts#L100-L110`）
+   - 三条命令 Webview 侧接收逻辑共用同一套：只要收到 `event.data.json` 为字符串就更新 state，驱动 `<JSONCrack>` 渲染（`apps/vscode/src/App.tsx#L26-L41`）
 7. **Chrome Worker 规避**：导入 `jsoncrack-react` 前临时 shadow 全局 `Worker`（`apps/chrome-extension/src/content-script.tsx#L38-L47`），使 ELK 走同步路径，应对 JSON 响应页的严格 CSP。
 8. **外部集成直通**：VSCode 扩展和 Chrome 扩展跳过 `useFile`/`jsonAdapter`（它们本身已确定是 JSON），直接将 JSON 传入 `<JSONCrack>`，由 `toJsonText()` + `parseGraph()` 处理，复用同一核心解析器。
 9. **双向格式桥**：`contentToJson()` + `jsonToContent()` 构成完整双向转换（`apps/www/src/lib/utils/jsonAdapter.ts`），BottomBar 切换格式时能无损互转（`apps/www/src/store/useFile.ts#L86-L98`）。
