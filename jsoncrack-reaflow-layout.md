@@ -264,42 +264,48 @@ Toolbar [Toolbar/index.tsx#L198-L210](file:///d:/fz/0601/solo-dogfeeding/code/18
 
 这是整个交互系统中最容易被忽视但至关重要的部分：**如何在同一画布上同时支持"单击选中/折叠"、"拖拽平移"、"双指缩放"三种指针操作而不互相干扰**。
 
-### 3.4 平移交互的双路径设计
+理解本节的前提：浏览器中 **pointer 事件和 mouse 事件是两套独立的事件流**。`pointerdown` ≠ `mousedown`，它们各自独立冒泡，互不影响。对其中一种事件调用 `stopPropagation()` 不会影响另一种事件的传播。这是本节分析的关键事实基础。
 
-项目实现了 **"默认拖拽平移 + 长按强制平移"** 双保险机制：
+---
+
+### 3.4 两套事件系统在同一画布上的协作
+
+画布上存在两套独立的"按下→拖拽→松开"检测系统，它们监听的是**不同类型的事件**：
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ 路径 A：Space 组件原生拖拽（默认）                                │
-│   react-zoomable-ui <Space> 组件内部封装了 hammerjs              │
-│   ├── 监听 pointerdown → pointermove → pointerup                │
-│   ├── 识别拖拽手势 → 驱动 camera.moveByInClientSpace()           │
-│   └── 光标样式：grab / grabbing (见 JSONCrackStyles L26-L32)     │
-│                                                                 │
-│ 路径 B：useLongPress 长按强制平移（兼容边缘场景）                  │
-│   use-long-press 库（150ms 阈值）                                │
-│   ├── 长按 150ms 触发 → setCanvasDragging(container, true)       │
-│   ├── 给 canvas 添加 .dragging CSS 类                            │
-│   ├── 松开时 → setCanvasDragging(container, false)               │
-│   └── 此时 Space 的原生拖拽接管（因为节点事件被屏蔽了）            │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│ 系统 A：Space 组件的拖拽平移                                         │
+│   react-zoomable-ui <Space> 内部使用 hammerjs                        │
+│   ├── 监听 mousedown / touchstart / pointerdown（取决于输入类型）      │
+│   ├── 识别 pan 手势 → 驱动 camera.moveByInClientSpace()              │
+│   └── 光标样式：grab / grabbing (JSONCrackStyles.module.css L26-L32) │
+│                                                                     │
+│ 系统 B：useLongPress 长按检测                                        │
+│   use-long-press@3.3.0（默认 detect: "pointer"）                    │
+│   ├── 监听 pointerdown → pointermove → pointerup                    │
+│   ├── 按住 ≥150ms 不松开 → 回调 setCanvasDragging(true)             │
+│   └── 松开时 → onFinish → setCanvasDragging(false)                   │
+│                                                                     │
+│ ⚠️ 两者监听的事件类型不同，互不干扰                                   │
+│ ⚠️ 系统B 的真正目的不是"接管拖拽"，而是"抑制拖拽中的交互副作用"       │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 路径 B 的详细实现
+#### 系统 B 的详细实现
 
 **长按绑定**：在 [JSONCrackComponent.tsx#L529-L532](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L529-L532)：
 
 ```tsx
 const bindLongPress = useLongPress(
-  () => setCanvasDragging(containerRef.current, true),  // 长按触发
+  () => setCanvasDragging(containerRef.current, true),
   {
-    threshold: 150,                                      // 150ms 判定为长按
-    onFinish: () => setCanvasDragging(containerRef.current, false),  // 松开清除
+    threshold: 150,
+    onFinish: () => setCanvasDragging(containerRef.current, false),
   }
 );
 ```
 
-**事件绑定位置**：在 [JSONCrackComponent.tsx#L537-L545](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L537-L545)，`bindLongPress()` 展开的事件处理器被绑定到最外层 `containerRef` div 上，覆盖整个画布区域。
+**事件绑定位置**：[JSONCrackComponent.tsx#L544](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L544)，`{...bindLongPress()}` 展开后实际注册的是 `onPointerDown / onPointerMove / onPointerUp / onPointerLeave`，绑定到 `containerRef` div。
 
 **setCanvasDragging 实现**：在 [canvasHelpers.ts#L102-L107](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/canvasHelpers.ts#L102-L107)：
 
@@ -311,115 +317,233 @@ export const setCanvasDragging = (container: HTMLElement | null, dragging: boole
 };
 ```
 
-**为什么需要路径 B？**
-- 当用户指针恰好落在某个交互元素（如折叠按钮）上按下时，节点的 `pointer-events: all` 会捕获事件，导致 Space 原生拖拽识别失败
-- 长按 150ms 后通过 CSS 强制屏蔽所有节点事件，让事件"穿透"到 Space 层，拖拽就能正常工作
+`.dragging` 类的 CSS 效果（[JSONCrackStyles.module.css#L34-L37](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackStyles.module.css#L34-L37)）：
+
+```css
+.canvasWrapper :global(.dragging),
+.canvasWrapper :global(.dragging *) {
+  pointer-events: none !important;
+}
+```
+
+**系统 B 的真正目的**：`.dragging` 类的作用不是"让事件穿透到 Space 以启用拖拽"——Space 本身已经能检测拖拽。它的真正目的是**消除拖拽过程中的交互副作用**：
+1. **抑制 hover 闪烁**：拖拽时指针经过节点，节点的 `onEnter/onLeave` 会反复改变描边色，视觉上产生蓝色闪烁。`.dragging` 使所有 canvas 子元素 `pointer-events: none`，hover 不再触发
+2. **统一光标**：折叠按钮有 `cursor: pointer`，拖拽经过按钮时光标会从 `grabbing` 跳到 `pointer`。`.dragging` 使按钮不可见给指针，光标保持 `grabbing`
+3. **防止误触**：拖拽结束时指针恰好在链接上，松手会打开 URL。`.dragging` 在按住期间使链接不可点击
 
 ---
 
-### 3.5 指针事件隔离的五层防护体系
+### 3.5 三类指针区域的事件路径分述
 
-整个系统通过 **CSS pointer-events 属性的五层精细控制**，实现了"默认可交互、拖拽时全屏蔽、特定元素穿透"的精确行为。
+画布上的指针区域按事件行为可分为三类，它们的 pointer-events 配置和事件冒泡路径截然不同。
 
-#### 层级结构与 pointer-events 配置
+#### 区域 1：节点 SVG rect + foreignObject 文本区（无交互子元素处）
+
+```
+DOM 结构：
+  <g> (Node wrapper)
+  ├── <rect> (SVG 矩形, onClick/onEnter/onLeave)
+  └── <foreignObject> (pointer-events: none)
+       └── HTML 文本内容 (继承 pointer-events: none)
+```
+
+**pointerdown 事件路径**：
+```
+rect → g(node wrapper) → g(contentGroup) → svg → div(.jsoncrack-canvas) → div(.jsoncrack-space) → div(containerRef)
+                                                                                                  ↑
+                                                                                    useLongPress 的 onPointerDown
+```
+
+**mousedown 事件路径**：
+```
+同上路径，Space 的 hammerjs 监听器在 .jsoncrack-space 上接收
+```
+
+**交互行为**：
+
+| 用户操作 | 结果 |
+|---------|------|
+| 快速点击（<150ms） | Node 的 `onClick` 触发 → 打开节点详情 |
+| 立即拖动（>5px） | Space 识别 pan → 画布平移；Node 的 `onClick` 不触发 |
+| 按住 ≥150ms 后拖动 | useLongPress 触发 → `.dragging` 类 → 抑制 hover/光标跳变 → Space 继续处理平移 |
+| 按住 ≥150ms 后松开 | useLongPress 触发 → `.dragging` 类 → 松开时 `onFinish` 移除类 → Node 的 `onClick` 仍可能触发 |
+
+**关键点**：SVG `<rect>` 没有 `onMouseDown stopPropagation`，也没有 `onPointerDown stopPropagation`，所以 pointer 和 mouse 事件都会正常冒泡到 Space 和 containerRef。这是最常见的交互区域，行为最简单。
+
+#### 区域 2：折叠按钮
+
+```
+DOM 结构：
+  <g> (Node wrapper)
+  ├── <rect> (SVG 矩形)
+  └── <foreignObject> (pointer-events: none)
+       └── <span> (pointer-events: none, .row)
+            └── <span.collapseButton> (pointer-events: all ← 覆盖父级 none)
+                 ├── onClick={handleToggle} (stopPropagation + preventDefault)
+                 └── onMouseDown={e => e.stopPropagation()}  ← ⚠️ 只阻断 mousedown
+```
+
+**pointerdown 事件路径**（useLongPress 检测用）：
+```
+span.collapseButton → span.row → foreignObject → g(node wrapper) → ... → div(containerRef)
+                                                                               ↑
+                                                                 useLongPress 的 onPointerDown ✅ 能到达
+```
+
+**mousedown 事件路径**（Space hammerjs 检测用）：
+```
+span.collapseButton → ❌ onMouseDown stopPropagation! → 冒泡在此中断
+```
+
+**mousedown 被 stopPropagation 阻断后的影响**：
+- Space 的 hammerjs 收不到 mousedown → **无法从按钮区域发起 pan 手势识别**
+- 但如果 hammerjs 同时监听了 pointerdown（取决于其输入类型检测），则 pointerdown 仍然会到达 Space
+
+**交互行为**：
+
+| 用户操作 | 结果 |
+|---------|------|
+| 快速点击（<150ms） | 按钮的 `onClick` 触发 → `handleToggle` → 折叠/展开；`stopPropagation` 阻止 Node 的 `onClick` |
+| 立即拖动（>5px） | 取决于 Space 的输入类型：若用 mousedown 则不响应；若用 pointerdown 则正常平移 |
+| 按住 ≥150ms | useLongPress 通过 **pointerdown** 检测到长按 → `.dragging` 类 → 按钮变为 `pointer-events: none !important` → 视觉上按钮"消失"给指针 |
+| 按住 ≥150ms 后松开 | `onFinish` 移除 `.dragging` → 但此时按钮的 `click` 事件可能已被 `.dragging` 屏蔽（因 `pointer-events: none` 在 pointerup 时仍生效，直到 React 重渲染移除类） |
+
+**折叠按钮 `onMouseDown stopPropagation` 的设计意图**：防止用户在按钮上 mousedown 时被 Space 误识别为 pan 起点。这是一种**保守的事件隔离**——宁可从按钮区域无法拖拽，也不要让点击按钮时意外触发平移。
+
+**但 `onMouseDown stopPropagation` 不影响 `pointerdown`**：因为这是两种独立事件。`useLongPress` 默认监听 pointer 事件，所以即使 mousedown 被阻断，长按检测仍然正常工作。
+
+#### 区域 3：超链接
+
+```
+DOM 结构：
+  <g> (Node wrapper)
+  ├── <rect> (SVG 矩形)
+  └── <foreignObject> (pointer-events: none)
+       └── <a.link> (pointer-events: all ← 覆盖父级 none)
+            └── onClick={e => e.stopPropagation()}  ← 只阻断 click，不阻断 mousedown/pointerdown
+```
+
+**pointerdown 事件路径**：
+```
+a.link → foreignObject → g(node wrapper) → ... → div(containerRef)
+                                                    ↑
+                                      useLongPress 的 onPointerDown ✅ 能到达
+```
+
+**mousedown 事件路径**：
+```
+a.link → foreignObject → g(node wrapper) → ... → div(.jsoncrack-space)
+                                                    ↑
+                                      Space hammerjs ✅ 能到达（无 stopPropagation）
+```
+
+**交互行为**：
+
+| 用户操作 | 结果 |
+|---------|------|
+| 快速点击（<150ms） | 链接 `onClick` 触发 → `stopPropagation` 阻止 Node 的 `onClick` → 浏览器打开 URL |
+| 立即拖动（>5px） | Space 识别 pan → 画布平移；链接 `onClick` 不触发（因为移动了） |
+| 按住 ≥150ms | useLongPress 触发 → `.dragging` 类 → 链接变为 `pointer-events: none` → **防止拖拽结束时误触链接** |
+| 按住 ≥150ms 后松开 | `onFinish` 移除 `.dragging` → 链接恢复正常可点击状态 |
+
+**关键区别**：链接只阻断 `click` 冒泡，不阻断 `mousedown/pointerdown`。这意味着从链接区域可以正常发起拖拽平移，同时 `onClick stopPropagation` 防止点击链接时触发 Node 的 `onClick`。
+
+---
+
+### 3.6 pointer-events 层级配置总览
+
+整个系统通过 **CSS pointer-events 的分层控制**，实现"默认可交互、拖拽时全屏蔽、特定元素穿透"的精确行为。
+
+#### 层级结构
 
 ```
 containerRef (最外层 div)
-│  绑定 bindLongPress() 事件
+│  绑定 useLongPress() → onPointerDown/Move/Up/Leave
 │
 ├── <Space> (react-zoomable-ui)
 │   │  className="jsoncrack-space"
 │   │  cursor: grab / grabbing (JSONCrackStyles L26-L32)
+│   │  hammerjs 手势识别 → pan/zoom
 │   │
-│   └── <Canvas> (reaflow)
+│   └── <Canvas> (reaflow) ← .dragging 类加在此元素上
 │        className="jsoncrack-canvas"
-│        pannable={false}, zoomable={false}  ← 禁用 Reaflow 事件
+│        pannable={false}, zoomable={false}
 │        │
 │        └── <svg>
 │             └── <g> (contentGroup)
 │                  │
 │                  ├── <g> (每个 Node)
-│                  │    ├── <rect> (Reaflow Node 矩形)
+│                  │    ├── <rect> (SVG 矩形)
 │                  │    │    onClick / onEnter / onLeave (CustomNode L26-L31)
+│                  │    │    无 mousedown/pointerdown stopPropagation
 │                  │    │
 │                  │    └── <foreignObject>
-│                  │         className={styles.foreignObject}
-│                  │         pointer-events: none  ← ⭐ 第1层：默认屏蔽 HTML 内容
+│                  │         pointer-events: none  ← ⭐ L1：屏蔽 HTML 内容
 │                  │         │
-│                  │         ├── .row (每一行数据)
+│                  │         ├── .row (文本行，继承 none)
 │                  │         │
-│                  │         └── .collapseButton (折叠按钮)
-│                  │              pointer-events: all  ← ⭐ 第2层：单独启用按钮
-│                  │              onClick={handleToggle} (ObjectNode L49-L54)
-│                  │              onMouseDown={e => e.stopPropagation()} (ObjectNode L76)
+│                  │         ├── .collapseButton
+│                  │         │    pointer-events: all  ← ⭐ L2：按钮单独启用
+│                  │         │    onMouseDown stopPropagation  ← 只阻断 mousedown
+│                  │         │    onClick stopPropagation + preventDefault
+│                  │         │
+│                  │         └── a.link
+│                  │              pointer-events: all  ← ⭐ L3：链接单独启用
+│                  │              onClick stopPropagation  ← 只阻断 click
 │                  │
 │                  └── <path> (每个 Edge)
-│                       onClick (CustomEdge L30-L50)
-│                       onEnter / onLeave (CustomEdge L56-L57)
+│                       onClick / onEnter / onLeave
 │
 ├── .overlay (加载遮罩)
-│    pointer-events: all  ← ⭐ 第3层：加载时屏蔽所有交互
+│    pointer-events: all  ← ⭐ L4：加载时屏蔽底层交互
 │    z-index: 30
 │
 └── .tooLarge (超量提示)
-     pointer-events: (默认 all)
      z-index: 40
 ```
 
-配合的 CSS 规则在 [JSONCrackStyles.module.css#L34-L37](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackStyles.module.css#L34-L37)：
+**`.dragging` 激活时的覆盖规则**（[JSONCrackStyles.module.css#L34-L37](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackStyles.module.css#L34-L37)）：
 
 ```css
 .canvasWrapper :global(.dragging),
 .canvasWrapper :global(.dragging *) {
-  pointer-events: none !important;  /* ⭐ 第4层：拖拽时全局强制屏蔽 */
+  pointer-events: none !important;  /* ⭐ L5：拖拽时全局强制屏蔽，覆盖所有子元素 */
 }
 ```
 
-节点内部的样式在 [Node.module.css#L10, L58](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/components/Node.module.css#L10)：
+`!important` 意味着它会覆盖 L2/L3 中 `.collapseButton` 和 `.link` 的 `pointer-events: all`。这是关键——拖拽时连按钮和链接都不可交互。
 
-```css
-.foreignObject {
-  pointer-events: none;  /* 默认禁用 foreignObject 内所有 HTML 元素的事件 */
-}
-
-.collapseButton {
-  pointer-events: all;   /* 折叠按钮单独启用，"穿透" foreignObject 的屏蔽 */
-  cursor: pointer;
-}
-```
-
-#### 各层职责详解
+#### 各层职责
 
 | 层级 | 配置位置 | 值 | 作用 |
 |------|---------|----|------|
-| **L1 节点默认屏蔽** | `foreignObject` → `pointer-events: none` | 默认不响应 | 让 SVG `<rect>` 接收点击/hover，而不是内部 HTML |
-| **L2 按钮穿透启用** | `.collapseButton` → `pointer-events: all` | 单独响应 | 折叠按钮"穿透" foreignObject 的屏蔽，可被点击 |
-| **L3 遮罩层拦截** | `.overlay` → `pointer-events: all` | 全量拦截 | 加载时显示遮罩，拦截所有底层交互 |
-| **L4 拖拽全局屏蔽** | `.dragging, .dragging *` → `pointer-events: none !important` | 强制不响应 | 长按平移时，所有节点/边都不接收事件，让 Space 原生拖拽生效 |
-| **L5 链接特殊处理** | `.link` (TextRenderer) → `pointer-events: all` | URL 响应 | 节点内的超链接需要单独启用，否则无法点击跳转 |
+| **L1** | `foreignObject` | `pointer-events: none` | 让 SVG `<rect>` 接收点击/hover，而非内部 HTML |
+| **L2** | `.collapseButton` | `pointer-events: all` | 按钮穿透 foreignObject 屏蔽，可被点击 |
+| **L3** | `a.link` | `pointer-events: all` | 链接穿透 foreignObject 屏蔽，可被点击 |
+| **L4** | `.overlay` | `pointer-events: all` | 加载时拦截所有底层交互 |
+| **L5** | `.dragging, .dragging *` | `pointer-events: none !important` | 长按拖拽时，覆盖 L1-L3，使所有 canvas 子元素不可交互 |
 
-#### 关键问题：为什么 foreignObject 默认 pointer-events: none？
+#### 为什么 foreignObject 默认 pointer-events: none？
 
-因为 Reaflow 的 `<Node>` 组件是 SVG `<g>` + `<rect>` 结构，节点的 `onClick` 绑定在 SVG 元素上。如果 foreignObject 内的 HTML 元素接收了 pointer events，会导致：
+Reaflow 的 `<Node>` 是 SVG `<g>` + `<rect>` 结构，节点的 `onClick`/`onEnter`/`onLeave` 绑定在 SVG 元素上。如果 foreignObject 内的 HTML 元素接收了 pointer events，会导致：
 1. 点击节点文字时，SVG `<rect>` 的 `onClick` 不会触发（被 HTML 元素吞了）
 2. hover 效果时有时无（取决于指针精确落在文字上还是空白上）
 
-通过 `foreignObject { pointer-events: none }`，让所有鼠标事件直接穿透到 SVG 层，保证节点交互行为一致。需要交互的元素（折叠按钮、超链接）再单独 `pointer-events: all` 启用。
+通过 `foreignObject { pointer-events: none }`，让所有指针事件直接穿透到 SVG 层，保证节点交互行为一致。需要交互的子元素（折叠按钮、超链接）再单独 `pointer-events: all` 启用。
 
 ---
 
-### 3.6 事件传播的精确控制
+### 3.7 事件传播控制：stopPropagation 的三处使用
 
-除了 pointer-events 的静态配置，代码中还有多处 **动态事件传播控制**，防止误触发：
+除了 pointer-events 的静态配置，代码中有三处 `stopPropagation` 实现了精确的事件隔离：
 
-#### 3.6.1 折叠按钮的事件隔离
+#### 3.7.1 折叠按钮 — 双重 stopPropagation
 
 在 [ObjectNode.tsx#L49-L54, L76](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/components/ObjectNode.tsx#L49-L54)：
 
 ```tsx
 const handleToggle = (event: React.MouseEvent) => {
-  if (!rowPath || !onToggleCollapse) return;
-  event.stopPropagation();   // ⚠️ 阻止冒泡到 Node 的 onClick
+  event.stopPropagation();   // 阻止 click 冒泡到 Node
   event.preventDefault();
   onToggleCollapse(rowPath);
 };
@@ -427,45 +551,46 @@ const handleToggle = (event: React.MouseEvent) => {
 <span
   className={styles.collapseButton}
   onClick={handleToggle}
-  onMouseDown={event => event.stopPropagation()}  // ⚠️ mousedown 也阻止冒泡
+  onMouseDown={event => event.stopPropagation()}  // 阻止 mousedown 冒泡
 >
 ```
 
-**双重 stopPropagation 的原因**：
-- `onClick.stopPropagation()`：防止触发 Node 外层的 `onNodeClick`（打开节点详情模态框）
-- `onMouseDown.stopPropagation()`：防止被 Space 识别为拖拽手势的起点（用户只想点击折叠，不是想拖拽）
+| stopPropagation 位置 | 阻断的事件 | 目的 |
+|----------------------|-----------|------|
+| `onMouseDown` | `mousedown` | 防止 Space/hammerjs 从按钮区域识别 pan 手势起点 |
+| `onClick` | `click` | 防止触发 Node 外层的 `onNodeClick`（打开详情模态框） |
 
-#### 3.6.2 超链接的事件隔离
+**注意**：`onMouseDown stopPropagation` 只阻断 `mousedown`，**不阻断 `pointerdown`**。因此 `useLongPress`（监听 pointer 事件）仍然能检测到在按钮上的长按。
 
-在 [TextRenderer.tsx#L22-L38](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/components/TextRenderer.tsx#L22-L38)：
+#### 3.7.2 超链接 — 只阻断 click
+
+在 [TextRenderer.tsx#L28-L30](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/components/TextRenderer.tsx#L28-L30)：
 
 ```tsx
 <a
-  className={styles.link}  /* pointer-events: all (TextRenderer.module.css L19) */
-  onClick={event => event.stopPropagation()}  // ⚠️ 阻止冒泡到 Node
-  href={href}
-  target="_blank"
-  rel="noopener noreferrer"
+  className={styles.link}
+  onClick={event => event.stopPropagation()}  // 只阻断 click
+  href={href} target="_blank" rel="noopener noreferrer"
 >
-  {text}
-</a>
 ```
 
-防止点击链接时同时触发节点选中。
+只阻断 `click` 冒泡，不阻断 `mousedown/pointerdown`。这意味着：
+- 点击链接不会触发 Node 的 `onClick`（被 stopPropagation 阻断）
+- 从链接区域可以正常发起拖拽平移（mousedown/pointerdown 正常冒泡到 Space）
+- 浏览器默认行为（打开 URL）不受影响（未调用 `preventDefault`）
 
-#### 3.6.3 右键菜单全局禁用
+#### 3.7.3 右键菜单 — 全局禁用
 
-在多处禁用原生右键菜单，避免干扰：
 - [JSONCrackComponent.tsx#L543](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L543)：`onContextMenu={event => event.preventDefault()}`
 - [JSONCrackComponent.tsx#L575](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L575)：Space 层同样阻止
 
 ---
 
-### 3.7 Space 手势与其他交互的配合关系
+### 3.8 Space 手势与三层区域的冲突化解
 
-`react-zoomable-ui` 的 `<Space>` 组件底层依赖 **`hammerjs@2.0.8`**（见 pnpm-lock.yaml L7995）处理手势识别，这是一套完整的触摸/鼠标手势识别引擎。
+`react-zoomable-ui` 的 `<Space>` 组件底层依赖 **`hammerjs@2.0.8`** 处理手势识别。
 
-#### 支持的手势类型
+#### 手势类型
 
 ```
 <Space> 手势识别层
@@ -475,76 +600,125 @@ const handleToggle = (event: React.MouseEvent) => {
 └── 双击     → （未启用，Space 有此能力但项目未配置）
 ```
 
-#### 触控板手势的可配置性
+#### 触控板手势可配置性
 
-`trackpadZoom` prop 在 [JSONCrackComponent.tsx#L80-L81](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L80-L81) 控制：
+`trackpadZoom` prop 在 [JSONCrackComponent.tsx#L576](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L576)：
 
 ```tsx
-<Space
-  treatTwoFingerTrackPadGesturesLikeTouch={trackpadZoom}
-/>
+<Space treatTwoFingerTrackPadGesturesLikeTouch={trackpadZoom} />
 ```
 
-- **`false`（默认）**：触控板双指滚动 = 页面滚动（平移画布），双指捏合 = 缩放（系统级）
-- **`true`**：触控板双指手势被识别为触摸手势，双指捏合 = 缩放，双指滚动 = 平移
+用户可在工具栏偏好设置中切换（见 [Toolbar/index.tsx#L307-L314](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L307-L314)）。
 
-用户可在工具栏偏好设置中切换（见 [Toolbar/index.tsx#L307-L314](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L307-L314) 的 "Zoom on Scroll" 选项）。
-
-#### 手势与点击/折叠的冲突化解
+#### 按区域分析冲突化解策略
 
 **核心矛盾**：pointerdown 时，系统不知道用户是想"单击"还是"拖拽"。
 
-**化解策略**（三层递进）：
+**区域 1（节点 rect + 文本区）的化解**——最简单，所有事件都正常冒泡：
 
 ```
-用户按下指针 (pointerdown)
+用户按下指针 → pointerdown + mousedown 都冒泡到 Space 和 containerRef
       │
-      ├─→ 事件捕获顺序：collapseButton → foreignObject(none) → Node rect → Space
+      ├─→ 快速松开 (<150ms)
+      │    └── Node onClick 触发 → 打开节点详情
       │
-      ├─→ 情况 1：立即松开 (<150ms)
-      │    ├── 若点在折叠按钮上 → handleToggle + stopPropagation → 仅折叠
-      │    ├── 若点在链接上 → 跳转浏览器
-      │    └── 否则 → Node onClick → 打开节点详情
+      ├─→ 立即移动 (>5px)
+      │    └── Space 识别 pan → 画布平移
+      │        Node onClick 不触发（移动超过 click 判定阈值）
       │
-      ├─→ 情况 2：移动超过拖拽阈值 (hammerjs 默认 ~5px)
-      │    ├── Space 识别为拖拽 → camera.moveBy() → 平移画布
-      │    └── Node 的 onClick 不会触发（因为移动超过 click 阈值）
-      │
-      └─→ 情况 3：按住不移动 ≥150ms
-           ├── useLongPress 触发 → setCanvasDragging(true) → .dragging 类生效
-           ├── 所有节点 pointer-events: none !important
-           └── 后续移动事件直接由 Space 接收 → 平移画布
+      └─→ 按住不动 ≥150ms
+           ├── useLongPress 触发 → .dragging 类
+           ├── 后续 hover/光标跳变被抑制（pointer-events: none）
+           └── Space 继续处理后续移动 → 平移画布
 ```
 
-这是一个非常精巧的 **"延迟决策"模式**：前 150ms 保持节点可交互，让点击/折叠能正常工作；超过 150ms 还没松开就判定为"用户想拖拽"，此时动态屏蔽节点事件，让拖拽流畅进行。
+**区域 2（折叠按钮）的化解**——最保守，mousedown 被阻断：
+
+```
+用户按下指针 → pointerdown 冒泡到 containerRef (useLongPress ✅)
+             → mousedown 被 stopPropagation ❌ 不冒泡到 Space
+      │
+      ├─→ 快速松开 (<150ms)
+      │    └── 按钮 onClick → handleToggle → 折叠/展开
+      │        Node onClick 不触发（被 stopPropagation 阻断）
+      │
+      ├─→ 立即移动 (>5px)
+      │    └── 取决于 Space 的输入类型检测：
+      │         若依赖 mousedown → 无法识别 pan → 不平移
+      │         若依赖 pointerdown → 正常平移
+      │
+      └─→ 按住不动 ≥150ms
+           ├── useLongPress 通过 pointerdown 检测到 → .dragging 类
+           ├── 按钮变为 pointer-events: none → 不再响应 hover/click
+           └── 后续行为取决于 Space 能否通过 pointerdown 识别 pan
+```
+
+**区域 3（超链接）的化解**——最开放，只阻断 click：
+
+```
+用户按下指针 → pointerdown + mousedown 都冒泡到 Space 和 containerRef
+      │
+      ├─→ 快速松开 (<150ms)
+      │    └── 链接 onClick → stopPropagation（阻止 Node onClick）+ 浏览器打开 URL
+      │
+      ├─→ 立即移动 (>5px)
+      │    └── Space 识别 pan → 画布平移
+      │        链接 onClick 不触发（移动超过 click 判定阈值）
+      │
+      └─→ 按住不动 ≥150ms
+           ├── useLongPress 触发 → .dragging 类
+           ├── 链接变为 pointer-events: none → 拖拽中不会误触打开 URL
+           └── Space 继续处理平移
+```
 
 ---
 
-### 3.8 状态机视角：交互模式切换
+### 3.9 状态机视角：交互模式切换
 
-整个交互系统可以看作一个三状态机：
+整个交互系统可以看作一个状态机，但不同区域的转移条件不同：
 
 ```
-┌─────────────┐   pointerdown + move > 5px    ┌──────────────┐
-│   IDLE      │ ───────────────────────────→ │  DRAGGING    │
-│ (空闲)      │                              │  (平移中)    │
-│ - 可点击    │ ← pointerup / mouseleave  ── │ - 节点禁用   │
-│ - 可折叠    │                              │ - cursor: grabbing │
-│ - cursor: grab │                            └──────────────┘
-└─────────────┘
-      │
-      │ pointerdown + 静止 ≥150ms
-      ▼
-┌─────────────┐
-│ LONG_PRESS  │
-│ (长按激活)  │
-│ - .dragging 类已加
-│ - 所有节点禁用
-│ - 后续 move 直接进入 DRAGGING
-└─────────────┘
-      │
-      └─→ pointerup → 清除 .dragging → 回到 IDLE
+                    区域 1 (节点rect/文本)        区域 2 (折叠按钮)           区域 3 (超链接)
+                    ─────────────────────        ─────────────────           ─────────────────
+  mousedown 到达    ✅ 是                         ❌ 否 (stopPropagation)    ✅ 是
+  pointerdown 到达  ✅ 是                         ✅ 是                      ✅ 是
+  Space 可 pan      ✅ 是                         部分 (看输入类型)           ✅ 是
+  useLongPress      ✅ 是                         ✅ 是 (通过 pointerdown)   ✅ 是
+
+                    ┌─────────────────────────────────────────────────────────────┐
+                    │                                                             │
+                    │   IDLE (空闲)                                               │
+                    │   - 可点击、可折叠、可跳转链接                                │
+                    │   - cursor: grab                                             │
+                    │                                                             │
+                    └──────┬──────────────────────┬──────────────────────┬────────┘
+                           │                      │                      │
+              区域1/3:     │         所有区域:      │         区域1/3:     │
+              pointerdown  │         pointerdown    │         pointerdown  │
+              + move > 5px │         + 静止 ≥150ms  │         + 快速松开   │
+                           │                      │                      │
+                           ▼                      ▼                      ▼
+                    ┌──────────────┐    ┌──────────────────┐      ┌──────────────┐
+                    │ DRAGGING     │    │ LONG_PRESS       │      │ CLICK        │
+                    │ (平移中)     │    │ (长按抑制中)      │      │ (单击触发)   │
+                    │ - Space pan  │    │ - .dragging 类   │      │ - 区域1:     │
+                    │ - 无额外抑制 │    │ - pointer-events │      │   Node详情   │
+                    │              │    │   全部 none      │      │ - 区域2:     │
+                    │              │    │ - hover/光标/误触│      │   折叠/展开  │
+                    │              │    │   全部被抑制     │      │ - 区域3:     │
+                    └──────────────┘    └──────────────────┘      │   打开URL    │
+                           │                      │               └──────────────┘
+                           │                      │                      │
+                           └──── pointerup ───────┴──────────────────────┘
+                                        ↓
+                                    回到 IDLE
+                                    (onFinish 移除 .dragging)
 ```
+
+**DRAGGING 和 LONG_PRESS 的区别**：
+- **DRAGGING**：用户开始移动后，Space 直接识别 pan，此时 `.dragging` 类**可能还没加**（因为还没到 150ms），hover 副作用仍然存在
+- **LONG_PRESS**：用户按住不动 150ms 后，`.dragging` 类被加上，后续任何移动都是在"抑制状态"下进行的
+- 实际上两种模式可能**重叠**：先移动触发 DRAGGING，持续按住超 150ms 又触发 LONG_PRESS，此时 `.dragging` 类补上，消除之前未抑制的 hover 副作用
 
 ---
 
@@ -684,22 +858,27 @@ Reaflow 在大型图上：
 - 不会因动画还在进行而校正到错误位置
 - 有超时兜底避免无限循环
 
-### 5.4 为什么 foreignObject 默认 pointer-events: none？
+### 5.4 `.dragging` 类的真正目的：消除拖拽副作用，而非"启用拖拽"
 
-Reaflow 的 `<Node>` 是 SVG `<g>` + `<rect>` 结构，节点的 `onClick` 绑定在 SVG 元素上。如果 foreignObject 内的 HTML 元素接收 pointer events，会导致：
-1. 点击节点文字时，SVG `<rect>` 的 `onClick` 不会触发（被 HTML 元素吞了）
-2. hover 效果时有时无（取决于指针精确落在文字上还是空白上）
+之前的分析曾误认为 useLongPress + `.dragging` 的作用是"让事件穿透到 Space 以启用拖拽"。实际上 **Space 本身已经能检测拖拽**（hammerjs 直接接收冒泡上来的 pointer/mouse 事件）。`.dragging` 类的三个真正目的是：
+1. **抑制 hover 闪烁**：拖拽时经过节点，`onEnter/onLeave` 不再反复触发描边变色
+2. **统一光标**：按钮的 `cursor: pointer` 不再覆盖 Space 的 `cursor: grabbing`
+3. **防止误触**：拖拽结束松手时不会误击链接打开 URL
 
-通过 `foreignObject { pointer-events: none }`，让所有鼠标事件直接穿透到 SVG 层，保证节点交互行为一致。需要交互的元素（折叠按钮、超链接）再单独 `pointer-events: all` 启用。
+### 5.5 pointer 事件与 mouse 事件的独立性是理解本系统的关键
 
-### 5.5 长按拖拽的 150ms 延迟决策机制精妙何在？
+`pointerdown` 和 `mousedown` 是两套独立的事件流，各自冒泡，互不影响。代码中的 `stopPropagation` 只阻断对应类型的事件：
+- 折叠按钮的 `onMouseDown stopPropagation` 只阻断 `mousedown`，不阻断 `pointerdown`
+- 因此 `useLongPress`（监听 pointer 事件）仍然能检测到折叠按钮上的长按
+- 但 Space/hammerjs 如果依赖 `mousedown` 来识别 pan 手势，则从按钮区域无法发起拖拽
 
-这是一个经典的"交互歧义化解"设计：
-- **前 150ms**：保持节点可交互 → 点击/折叠能正常工作，用户感知"零延迟"
-- **150ms 后**：判定为拖拽意图 → 动态加 `.dragging` 类 → 所有节点事件屏蔽 → Space 原生拖拽接管
-- **移动超过 5px**：hammerjs 直接识别为拖拽 → 不需要等 150ms
+### 5.6 三类区域的 stopPropagation 策略对比
 
-三种情况互不干扰：快点击、慢拖拽、中速移动，分别对应不同的交互意图。
+| 区域 | 阻断 mousedown | 阻断 pointerdown | 阻断 click | 设计意图 |
+|------|---------------|-----------------|------------|---------|
+| 节点 rect + 文本 | ❌ | ❌ | ❌ | 完全开放，点击/拖拽/长按都正常工作 |
+| 折叠按钮 | ✅ `onMouseDown stopPropagation` | ❌ | ✅ `onClick stopPropagation` | 保守隔离：确保点击不误触，但从按钮拖拽可能受限 |
+| 超链接 | ❌ | ❌ | ✅ `onClick stopPropagation` | 开放策略：点击不误触 Node，但拖拽/长按正常工作 |
 
 ---
 
