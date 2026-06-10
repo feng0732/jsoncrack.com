@@ -264,7 +264,17 @@ Toolbar [Toolbar/index.tsx#L198-L210](file:///d:/fz/0601/solo-dogfeeding/code/18
 
 这是整个交互系统中最容易被忽视但至关重要的部分：**如何在同一画布上同时支持"单击选中/折叠"、"拖拽平移"、"双指缩放"三种指针操作而不互相干扰**。
 
-理解本节的前提：浏览器中 **pointer 事件和 mouse 事件是两套独立的事件流**。`pointerdown` ≠ `mousedown`，它们各自独立冒泡，互不影响。对其中一种事件调用 `stopPropagation()` 不会影响另一种事件的传播。这是本节分析的关键事实基础。
+### 证据边界说明
+
+本节分析严格区分三类证据：
+
+| 标记 | 含义 | 验证方式 |
+|------|------|---------|
+| ✅ **仓库源码** | 本仓库内可直接验证的代码事实 | `Read` 对应文件即可确认 |
+| 🌐 **外部依赖源码** | 通过 unpkg 获取的 npm 包发布版本源码 | 访问对应 URL 可验证 |
+| ⚠️ **推断结论** | 基于源码合理推断、但未在运行时验证的行为 | 需要实际运行测试才能 100% 确认 |
+
+理解本节的前提：浏览器中 **pointer 事件和 mouse 事件是两套独立的事件流**。`pointerdown` ≠ `mousedown`，它们各自独立冒泡，互不影响。对其中一种事件调用 `stopPropagation()` 不会影响另一种事件的传播。这是本节分析的关键事实基础（✅ 仓库源码 + 🌐 外部依赖源码 双重确认）。
 
 ---
 
@@ -273,25 +283,26 @@ Toolbar [Toolbar/index.tsx#L198-L210](file:///d:/fz/0601/solo-dogfeeding/code/18
 画布上存在两套独立的"按下→拖拽→松开"检测系统，它们监听的是**不同类型的事件**：
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│ 系统 A：Space 组件的拖拽平移                                         │
-│   react-zoomable-ui <Space> 内部使用 hammerjs                        │
-│   ├── 监听 mousedown / touchstart / pointerdown（取决于输入类型）      │
-│   ├── 识别 pan 手势 → 驱动 camera.moveByInClientSpace()              │
-│   └── 光标样式：grab / grabbing (JSONCrackStyles.module.css L26-L32) │
-│                                                                     │
-│ 系统 B：useLongPress 长按检测                                        │
-│   use-long-press@3.3.0（默认 detect: "pointer"）                    │
-│   ├── 监听 pointerdown → pointermove → pointerup                    │
-│   ├── 按住 ≥150ms 不松开 → 回调 setCanvasDragging(true)             │
-│   └── 松开时 → onFinish → setCanvasDragging(false)                   │
-│                                                                     │
-│ ⚠️ 两者监听的事件类型不同，互不干扰                                   │
-│ ⚠️ 系统B 的真正目的不是"接管拖拽"，而是"抑制拖拽中的交互副作用"       │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│ 系统 A：Space 组件的拖拽平移（🌐 react-zoomable-ui@0.11.0 ViewPort.js）   │
+│   ├── hammerjs 处理：pan/pinch 手势                                       │
+│   │   ├── pan threshold 显式设为 0（L408，不是默认 10px）                 │
+│   │   └── 输入类型自动检测：PointerEvent > Touch > Mouse（🌐 hammerjs）     │
+│   ├── 自行监听：mousedown/mousemove/mouseup（L379-L381）                  │
+│   │           + wheel（L394）+ touch 事件（L383-L385）                    │
+│   └── 光标样式：grab / grabbing (✅ JSONCrackStyles.module.css L26-L32)    │
+│                                                                        │
+│ 系统 B：useLongPress 长按检测（🌐 use-long-press@3.3.0 默认 detect: pointer）│
+│   ├── 监听 pointerdown → pointermove → pointerup → pointerleave         │
+│   ├── 按住 ≥150ms 不松开 → 回调 setCanvasDragging(true)（✅ L529-L532）   │
+│   └── 松开时 → onFinish → setCanvasDragging(false)（✅ L529-L532）        │
+│                                                                        │
+│ ⚠️ 两套系统监听的事件类型不同，互不干扰                                    │
+│ ⚠️ 系统 B 的真正目的不是"接管拖拽"，而是"抑制拖拽中的交互副作用"           │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 系统 B 的详细实现
+#### 系统 B 的详细实现（全部 ✅ 仓库源码）
 
 **长按绑定**：在 [JSONCrackComponent.tsx#L529-L532](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L529-L532)：
 
@@ -305,7 +316,7 @@ const bindLongPress = useLongPress(
 );
 ```
 
-**事件绑定位置**：[JSONCrackComponent.tsx#L544](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L544)，`{...bindLongPress()}` 展开后实际注册的是 `onPointerDown / onPointerMove / onPointerUp / onPointerLeave`，绑定到 `containerRef` div。
+**事件绑定位置**：[JSONCrackComponent.tsx#L544](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L544)，`{...bindLongPress()}` 展开后实际注册的是 `onPointerDown / onPointerMove / onPointerUp / onPointerLeave`，绑定到 `containerRef` div（🌐 use-long-press@3.3.0 源码确认：默认 `detect: "pointer"`，监听 `pointerdown/pointermove/pointerup/pointerleave/pointerout`）。
 
 **setCanvasDragging 实现**：在 [canvasHelpers.ts#L102-L107](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/canvasHelpers.ts#L102-L107)：
 
@@ -317,7 +328,7 @@ export const setCanvasDragging = (container: HTMLElement | null, dragging: boole
 };
 ```
 
-`.dragging` 类的 CSS 效果（[JSONCrackStyles.module.css#L34-L37](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackStyles.module.css#L34-L37)）：
+`.dragging` 类的 CSS 效果（✅ [JSONCrackStyles.module.css#L34-L37](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackStyles.module.css#L34-L37)）：
 
 ```css
 .canvasWrapper :global(.dragging),
@@ -326,7 +337,7 @@ export const setCanvasDragging = (container: HTMLElement | null, dragging: boole
 }
 ```
 
-**系统 B 的真正目的**：`.dragging` 类的作用不是"让事件穿透到 Space 以启用拖拽"——Space 本身已经能检测拖拽。它的真正目的是**消除拖拽过程中的交互副作用**：
+**系统 B 的真正目的**：`.dragging` 类的作用 **不是** "让事件穿透到 Space 以启用拖拽"——Space 本身已经能检测拖拽（🌐 react-zoomable-ui@0.11.0 ViewPort.js 确认：hammerjs + 自行监听都在工作）。它的真正目的是**消除拖拽过程中的交互副作用**：
 1. **抑制 hover 闪烁**：拖拽时指针经过节点，节点的 `onEnter/onLeave` 会反复改变描边色，视觉上产生蓝色闪烁。`.dragging` 使所有 canvas 子元素 `pointer-events: none`，hover 不再触发
 2. **统一光标**：折叠按钮有 `cursor: pointer`，拖拽经过按钮时光标会从 `grabbing` 跳到 `pointer`。`.dragging` 使按钮不可见给指针，光标保持 `grabbing`
 3. **防止误触**：拖拽结束时指针恰好在链接上，松手会打开 URL。`.dragging` 在按住期间使链接不可点击
@@ -340,7 +351,7 @@ export const setCanvasDragging = (container: HTMLElement | null, dragging: boole
 #### 区域 1：节点 SVG rect + foreignObject 文本区（无交互子元素处）
 
 ```
-DOM 结构：
+DOM 结构（✅ 仓库源码）：
   <g> (Node wrapper)
   ├── <rect> (SVG 矩形, onClick/onEnter/onLeave)
   └── <foreignObject> (pointer-events: none)
@@ -356,24 +367,24 @@ rect → g(node wrapper) → g(contentGroup) → svg → div(.jsoncrack-canvas) 
 
 **mousedown 事件路径**：
 ```
-同上路径，Space 的 hammerjs 监听器在 .jsoncrack-space 上接收
+同上路径，Space 的监听器在 .jsoncrack-space 上接收
 ```
 
 **交互行为**：
 
-| 用户操作 | 结果 |
-|---------|------|
-| 快速点击（<150ms） | Node 的 `onClick` 触发 → 打开节点详情 |
-| 立即拖动（>5px） | Space 识别 pan → 画布平移；Node 的 `onClick` 不触发 |
-| 按住 ≥150ms 后拖动 | useLongPress 触发 → `.dragging` 类 → 抑制 hover/光标跳变 → Space 继续处理平移 |
-| 按住 ≥150ms 后松开 | useLongPress 触发 → `.dragging` 类 → 松开时 `onFinish` 移除类 → Node 的 `onClick` 仍可能触发 |
+| 用户操作 | 结果 | 证据类型 |
+|---------|------|---------|
+| 快速点击（<150ms） | Node 的 `onClick` 触发 → 打开节点详情 | ✅ 仓库源码 |
+| 立即移动 | Space 识别 pan → 画布平移；Node 的 `onClick` 不触发（移动超过 click 判定阈值） | 🌐 hammerjs pan threshold = 0 + ⚠️ 浏览器 click 判定 |
+| 按住 ≥150ms 后移动 | useLongPress 触发 → `.dragging` 类 → 抑制 hover/光标跳变 → Space 继续处理平移 | ✅ 仓库源码 + 🌐 use-long-press |
+| 按住 ≥150ms 后松开 | useLongPress 触发 → `.dragging` 类 → 松开时 `onFinish` 移除类 → Node 的 `onClick` 触发情况取决于浏览器 | ⚠️ 推断（pointer-events: none 对 click 的影响） |
 
-**关键点**：SVG `<rect>` 没有 `onMouseDown stopPropagation`，也没有 `onPointerDown stopPropagation`，所以 pointer 和 mouse 事件都会正常冒泡到 Space 和 containerRef。这是最常见的交互区域，行为最简单。
+**关键点**（✅ 仓库源码）：SVG `<rect>` 没有 `onMouseDown stopPropagation`，也没有 `onPointerDown stopPropagation`，所以 pointer 和 mouse 事件都会正常冒泡到 Space 和 containerRef。这是最常见的交互区域，行为最简单。
 
 #### 区域 2：折叠按钮
 
 ```
-DOM 结构：
+DOM 结构（✅ 仓库源码）：
   <g> (Node wrapper)
   ├── <rect> (SVG 矩形)
   └── <foreignObject> (pointer-events: none)
@@ -395,27 +406,29 @@ span.collapseButton → span.row → foreignObject → g(node wrapper) → ... �
 span.collapseButton → ❌ onMouseDown stopPropagation! → 冒泡在此中断
 ```
 
-**mousedown 被 stopPropagation 阻断后的影响**：
-- Space 的 hammerjs 收不到 mousedown → **无法从按钮区域发起 pan 手势识别**
-- 但如果 hammerjs 同时监听了 pointerdown（取决于其输入类型检测），则 pointerdown 仍然会到达 Space
+**mousedown 被 stopPropagation 阻断后的影响**（🌐 react-zoomable-ui@0.11.0 ViewPort.js）：
+- Space 自己的 `handleMouseDown` 监听器收不到 mousedown → **无法从按钮区域发起鼠标拖拽**
+- 但 Space/hammerjs 的 `PointerEventInput` 可能仍然能收到 pointerdown（取决于浏览器支持）
+- 🌐 hammerjs 源码确认：优先使用 PointerEvent（如果浏览器支持），否则 fallback 到 Mouse/Touch
 
 **交互行为**：
 
-| 用户操作 | 结果 |
-|---------|------|
-| 快速点击（<150ms） | 按钮的 `onClick` 触发 → `handleToggle` → 折叠/展开；`stopPropagation` 阻止 Node 的 `onClick` |
-| 立即拖动（>5px） | 取决于 Space 的输入类型：若用 mousedown 则不响应；若用 pointerdown 则正常平移 |
-| 按住 ≥150ms | useLongPress 通过 **pointerdown** 检测到长按 → `.dragging` 类 → 按钮变为 `pointer-events: none !important` → 视觉上按钮"消失"给指针 |
-| 按住 ≥150ms 后松开 | `onFinish` 移除 `.dragging` → 但此时按钮的 `click` 事件可能已被 `.dragging` 屏蔽（因 `pointer-events: none` 在 pointerup 时仍生效，直到 React 重渲染移除类） |
+| 用户操作 | 结果 | 证据类型 |
+|---------|------|---------|
+| 快速点击（<150ms） | 按钮的 `onClick` 触发 → `handleToggle` → 折叠/展开；`stopPropagation` 阻止 Node 的 `onClick` | ✅ 仓库源码 |
+| 立即移动（鼠标） | mousedown 被 stopPropagation 阻断 → **Space 不识别 pan** → 不平移 | ✅ 仓库源码 + 🌐 react-zoomable-ui |
+| 立即移动（触摸/支持 PointerEvent） | pointerdown 未被阻断 → Space 正常识别 pan → 平移 | 🌐 hammerjs PointerEventInput |
+| 按住 ≥150ms | useLongPress 通过 **pointerdown** 检测到长按 → `.dragging` 类 → 按钮变为 `pointer-events: none !important` | ✅ 仓库源码 + 🌐 use-long-press |
+| 按住 ≥150ms 后松开 | `onFinish` 移除 `.dragging` → 但此时按钮的 `click` 事件可能已被 `.dragging` 屏蔽 | ⚠️ 推断 |
 
-**折叠按钮 `onMouseDown stopPropagation` 的设计意图**：防止用户在按钮上 mousedown 时被 Space 误识别为 pan 起点。这是一种**保守的事件隔离**——宁可从按钮区域无法拖拽，也不要让点击按钮时意外触发平移。
+**折叠按钮 `onMouseDown stopPropagation` 的设计意图**（✅ 仓库源码）：防止用户在按钮上 mousedown 时被 Space 误识别为 pan 起点。这是一种**保守的事件隔离**——宁可从按钮区域无法用鼠标拖拽，也不要让点击按钮时意外触发平移。
 
-**但 `onMouseDown stopPropagation` 不影响 `pointerdown`**：因为这是两种独立事件。`useLongPress` 默认监听 pointer 事件，所以即使 mousedown 被阻断，长按检测仍然正常工作。
+**但 `onMouseDown stopPropagation` 不影响 `pointerdown`**（✅ 仓库源码 + 🌐 use-long-press）：因为这是两种独立事件。`useLongPress` 默认监听 pointer 事件，所以即使 mousedown 被阻断，长按检测仍然正常工作。
 
 #### 区域 3：超链接
 
 ```
-DOM 结构：
+DOM 结构（✅ 仓库源码）：
   <g> (Node wrapper)
   ├── <rect> (SVG 矩形)
   └── <foreignObject> (pointer-events: none)
@@ -434,19 +447,19 @@ a.link → foreignObject → g(node wrapper) → ... → div(containerRef)
 ```
 a.link → foreignObject → g(node wrapper) → ... → div(.jsoncrack-space)
                                                     ↑
-                                      Space hammerjs ✅ 能到达（无 stopPropagation）
+                                      Space 监听器 ✅ 能到达（无 stopPropagation）
 ```
 
 **交互行为**：
 
-| 用户操作 | 结果 |
-|---------|------|
-| 快速点击（<150ms） | 链接 `onClick` 触发 → `stopPropagation` 阻止 Node 的 `onClick` → 浏览器打开 URL |
-| 立即拖动（>5px） | Space 识别 pan → 画布平移；链接 `onClick` 不触发（因为移动了） |
-| 按住 ≥150ms | useLongPress 触发 → `.dragging` 类 → 链接变为 `pointer-events: none` → **防止拖拽结束时误触链接** |
-| 按住 ≥150ms 后松开 | `onFinish` 移除 `.dragging` → 链接恢复正常可点击状态 |
+| 用户操作 | 结果 | 证据类型 |
+|---------|------|---------|
+| 快速点击（<150ms） | 链接 `onClick` 触发 → `stopPropagation` 阻止 Node 的 `onClick` → 浏览器打开 URL | ✅ 仓库源码 |
+| 立即移动 | Space 识别 pan → 画布平移；链接 `onClick` 不触发（移动超过 click 判定阈值） | 🌐 hammerjs pan threshold = 0 + ⚠️ 浏览器 click 判定 |
+| 按住 ≥150ms | useLongPress 触发 → `.dragging` 类 → 链接变为 `pointer-events: none` → **防止拖拽结束时误触链接** | ✅ 仓库源码 |
+| 按住 ≥150ms 后松开 | `onFinish` 移除 `.dragging` → 链接恢复正常可点击状态 | ✅ 仓库源码 |
 
-**关键区别**：链接只阻断 `click` 冒泡，不阻断 `mousedown/pointerdown`。这意味着从链接区域可以正常发起拖拽平移，同时 `onClick stopPropagation` 防止点击链接时触发 Node 的 `onClick`。
+**关键区别**（✅ 仓库源码）：链接只阻断 `click` 冒泡，不阻断 `mousedown/pointerdown`。这意味着从链接区域可以正常发起拖拽平移，同时 `onClick stopPropagation` 防止点击链接时触发 Node 的 `onClick`。
 
 ---
 
@@ -462,8 +475,8 @@ containerRef (最外层 div)
 │
 ├── <Space> (react-zoomable-ui)
 │   │  className="jsoncrack-space"
-│   │  cursor: grab / grabbing (JSONCrackStyles L26-L32)
-│   │  hammerjs 手势识别 → pan/zoom
+│   │  cursor: grab / grabbing (✅ JSONCrackStyles L26-L32)
+│   │  hammerjs pan(priority: PointerEvent) + 自行监听 wheel/mouse/touch
 │   │
 │   └── <Canvas> (reaflow) ← .dragging 类加在此元素上
 │        className="jsoncrack-canvas"
@@ -474,7 +487,7 @@ containerRef (最外层 div)
 │                  │
 │                  ├── <g> (每个 Node)
 │                  │    ├── <rect> (SVG 矩形)
-│                  │    │    onClick / onEnter / onLeave (CustomNode L26-L31)
+│                  │    │    onClick / onEnter / onLeave (✅ CustomNode L26-L31)
 │                  │    │    无 mousedown/pointerdown stopPropagation
 │                  │    │
 │                  │    └── <foreignObject>
@@ -502,7 +515,7 @@ containerRef (最外层 div)
      z-index: 40
 ```
 
-**`.dragging` 激活时的覆盖规则**（[JSONCrackStyles.module.css#L34-L37](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackStyles.module.css#L34-L37)）：
+**`.dragging` 激活时的覆盖规则**（✅ [JSONCrackStyles.module.css#L34-L37](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackStyles.module.css#L34-L37)）：
 
 ```css
 .canvasWrapper :global(.dragging),
@@ -515,13 +528,13 @@ containerRef (最外层 div)
 
 #### 各层职责
 
-| 层级 | 配置位置 | 值 | 作用 |
-|------|---------|----|------|
-| **L1** | `foreignObject` | `pointer-events: none` | 让 SVG `<rect>` 接收点击/hover，而非内部 HTML |
-| **L2** | `.collapseButton` | `pointer-events: all` | 按钮穿透 foreignObject 屏蔽，可被点击 |
-| **L3** | `a.link` | `pointer-events: all` | 链接穿透 foreignObject 屏蔽，可被点击 |
-| **L4** | `.overlay` | `pointer-events: all` | 加载时拦截所有底层交互 |
-| **L5** | `.dragging, .dragging *` | `pointer-events: none !important` | 长按拖拽时，覆盖 L1-L3，使所有 canvas 子元素不可交互 |
+| 层级 | 配置位置 | 值 | 作用 | 证据 |
+|------|---------|----|------|------|
+| **L1** | `foreignObject` | `pointer-events: none` | 让 SVG `<rect>` 接收点击/hover，而非内部 HTML | ✅ Node.module.css L10 |
+| **L2** | `.collapseButton` | `pointer-events: all` | 按钮穿透 foreignObject 屏蔽，可被点击 | ✅ Node.module.css L58 |
+| **L3** | `a.link` | `pointer-events: all` | 链接穿透 foreignObject 屏蔽，可被点击 | ✅ TextRenderer.module.css L19 |
+| **L4** | `.overlay` | `pointer-events: all` | 加载时拦截所有底层交互 | ✅ JSONCrackStyles.module.css L56 |
+| **L5** | `.dragging, .dragging *` | `pointer-events: none !important` | 长按拖拽时，覆盖 L1-L3，使所有 canvas 子元素不可交互 | ✅ JSONCrackStyles.module.css L34-L37 |
 
 #### 为什么 foreignObject 默认 pointer-events: none？
 
@@ -529,7 +542,7 @@ Reaflow 的 `<Node>` 是 SVG `<g>` + `<rect>` 结构，节点的 `onClick`/`onEn
 1. 点击节点文字时，SVG `<rect>` 的 `onClick` 不会触发（被 HTML 元素吞了）
 2. hover 效果时有时无（取决于指针精确落在文字上还是空白上）
 
-通过 `foreignObject { pointer-events: none }`，让所有指针事件直接穿透到 SVG 层，保证节点交互行为一致。需要交互的子元素（折叠按钮、超链接）再单独 `pointer-events: all` 启用。
+通过 `foreignObject { pointer-events: none }`，让所有指针事件直接穿透到 SVG 层，保证节点交互行为一致。需要交互的子元素（折叠按钮、超链接）再单独 `pointer-events: all` 启用。（✅ 仓库源码确认配置，⚠️ 行为推断）
 
 ---
 
@@ -539,7 +552,7 @@ Reaflow 的 `<Node>` 是 SVG `<g>` + `<rect>` 结构，节点的 `onClick`/`onEn
 
 #### 3.7.1 折叠按钮 — 双重 stopPropagation
 
-在 [ObjectNode.tsx#L49-L54, L76](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/components/ObjectNode.tsx#L49-L54)：
+在 [ObjectNode.tsx#L49-L54, L76](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/components/ObjectNode.tsx#L49-L54)（✅ 仓库源码）：
 
 ```tsx
 const handleToggle = (event: React.MouseEvent) => {
@@ -555,16 +568,16 @@ const handleToggle = (event: React.MouseEvent) => {
 >
 ```
 
-| stopPropagation 位置 | 阻断的事件 | 目的 |
-|----------------------|-----------|------|
-| `onMouseDown` | `mousedown` | 防止 Space/hammerjs 从按钮区域识别 pan 手势起点 |
-| `onClick` | `click` | 防止触发 Node 外层的 `onNodeClick`（打开详情模态框） |
+| stopPropagation 位置 | 阻断的事件 | 目的 | 证据 |
+|----------------------|-----------|------|------|
+| `onMouseDown` | `mousedown` | 防止 Space 的 `handleMouseDown` 从按钮区域识别 pan 手势起点 | ✅ 仓库源码（ObjectNode.tsx L76） + 🌐 react-zoomable-ui ViewPort.js L379-L381 |
+| `onClick` | `click` | 防止触发 Node 外层的 `onNodeClick`（打开详情模态框） | ✅ 仓库源码（ObjectNode.tsx L49-L54） |
 
-**注意**：`onMouseDown stopPropagation` 只阻断 `mousedown`，**不阻断 `pointerdown`**。因此 `useLongPress`（监听 pointer 事件）仍然能检测到在按钮上的长按。
+**注意**：`onMouseDown stopPropagation` 只阻断 `mousedown`，**不阻断 `pointerdown`**。因此 `useLongPress`（监听 pointer 事件）仍然能检测到在按钮上的长按（🌐 use-long-press@3.3.0 确认默认 detect: "pointer"）。
 
 #### 3.7.2 超链接 — 只阻断 click
 
-在 [TextRenderer.tsx#L28-L30](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/components/TextRenderer.tsx#L28-L30)：
+在 [TextRenderer.tsx#L28-L30](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/components/TextRenderer.tsx#L28-L30)（✅ 仓库源码）：
 
 ```tsx
 <a
@@ -586,23 +599,56 @@ const handleToggle = (event: React.MouseEvent) => {
 
 ---
 
-### 3.8 Space 手势与三层区域的冲突化解
+### 3.8 Space 内部阈值与步长证据汇总
 
-`react-zoomable-ui` 的 `<Space>` 组件底层依赖 **`hammerjs@2.0.8`** 处理手势识别。
+在深入分析冲突化解之前，先集中展示 `<Space>` 内部所有关键阈值和步长的完整证据链，严格区分三类证据：
+
+| 参数 | 值 | 证据类型 | 源码位置 |
+|-----|----|---------|---------|
+| **pan 拖拽阈值** | **0**（不是 hammerjs 默认 10px） | 🌐 外部依赖源码 | react-zoomable-ui@0.11.0 ViewPort.js L408 |
+| **滚轮缩放步长** | 动态 `dZoom = ((-1 * dy) / containerHeight) * zoomFactor` | 🌐 外部依赖源码 | react-zoomable-ui@0.11.0 ViewPort.js L341-L342 |
+| **工具栏按钮缩放步长** | 固定 ±0.1 | ✅ 仓库源码 | canvasHelpers.ts L257-L260 |
+| **hammerjs 输入优先级** | PointerEvent > Touch > Mouse | 🌐 外部依赖源码 | hammerjs@2.0.8 输入类型检测逻辑 |
+| **useLongPress 事件类型** | 默认 `detect: "pointer"` | 🌐 外部依赖源码 | use-long-press@3.3.0 源码事件数组 |
+| **useLongPress 时间阈值** | 150ms（可配置） | ✅ 仓库源码 | JSONCrackComponent.tsx L529-L532 |
+
+---
+
+### 3.8.1 Space 手势识别分层
+
+`react-zoomable-ui` 的 `<Space>` 组件手势识别分为两部分（🌐 react-zoomable-ui@0.11.0 ViewPort.js）：
+1. **hammerjs**：用于 pan 和 pinch 手势，pan threshold 显式设置为 **0**（不是默认的 10px）
+2. **自行监听**：wheel 滚轮缩放、mousedown/mousemove/mouseup 处理右键平移、touchstart/touchend 处理触摸点击
 
 #### 手势类型
 
 ```
-<Space> 手势识别层
-├── 单指拖拽 → camera.moveByInClientSpace()   （平移）
-├── 双指捏合 → camera.recenter(,, newZoom)    （缩放，trackpadZoom 控制）
-├── 滚轮滚动 → camera.recenter(,, zoom±0.1)  （缩放，默认启用）
-└── 双击     → （未启用，Space 有此能力但项目未配置）
+<Space> 手势识别层（🌐 react-zoomable-ui@0.11.0 ViewPort.js）
+├── hammerjs pan → camera.moveByInClientSpace()     （平移，🌐 L408 threshold = 0）
+├── hammerjs pinch → camera.recenter(,, newZoom)     （双指缩放，🌐 L407）
+├── 自行监听 wheel → handleWheel() 计算 dZoom       （滚轮缩放，🌐 L341-L342 动态步长）
+├── 自行监听 mousedown/up → 处理点击/右键平移        （鼠标，🌐 L379-L381）
+└── 自行监听 touchstart/end → 处理触摸点击           （触摸，🌐 L383-L385）
 ```
+
+**滚轮缩放步长**（🌐 react-zoomable-ui@0.11.0 ViewPort.js L317-L349 `handleWheel`）：
+```js
+// L341-L342
+const dy = e.deltaY * scale;
+const dZoom = ((-1 * dy) / this.containerHeight) * this.zoomFactor;
+```
+🌐 外部依赖源码确认：不是固定的 ±0.1，而是与滚轮滚动距离、容器高度、当前缩放比相关的动态值。scale 系数根据 deltaMode 调整（L330-L336）。
+
+**工具栏按钮缩放步长**（✅ [canvasHelpers.ts#L257-L260](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/canvasHelpers.ts#L257-L260)）：
+```ts
+// ✅ 仓库源码确认：delta 固定为 0.1
+viewPort.camera?.recenter(viewPort.centerX, viewPort.centerY, viewPort.zoomFactor + delta);
+```
+✅ 仓库源码确认：delta 固定为 0.1。这是工具栏按钮调用 `adjustViewPortZoom(viewPort, +0.1)` 时传入的固定值，与滚轮缩放的动态步长完全不同。
 
 #### 触控板手势可配置性
 
-`trackpadZoom` prop 在 [JSONCrackComponent.tsx#L576](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L576)：
+`trackpadZoom` prop 在 [JSONCrackComponent.tsx#L576](file:///d:/fz/0601/solo-dogfeeding/code/182-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L576)（✅ 仓库源码）：
 
 ```tsx
 <Space treatTwoFingerTrackPadGesturesLikeTouch={trackpadZoom} />
@@ -622,9 +668,9 @@ const handleToggle = (event: React.MouseEvent) => {
       ├─→ 快速松开 (<150ms)
       │    └── Node onClick 触发 → 打开节点详情
       │
-      ├─→ 立即移动 (>5px)
+      ├─→ 立即移动（任何距离，threshold = 0）
       │    └── Space 识别 pan → 画布平移
-      │        Node onClick 不触发（移动超过 click 判定阈值）
+      │        Node onClick 不触发（移动超过浏览器 click 判定阈值）
       │
       └─→ 按住不动 ≥150ms
            ├── useLongPress 触发 → .dragging 类
@@ -642,10 +688,11 @@ const handleToggle = (event: React.MouseEvent) => {
       │    └── 按钮 onClick → handleToggle → 折叠/展开
       │        Node onClick 不触发（被 stopPropagation 阻断）
       │
-      ├─→ 立即移动 (>5px)
-      │    └── 取决于 Space 的输入类型检测：
-      │         若依赖 mousedown → 无法识别 pan → 不平移
-      │         若依赖 pointerdown → 正常平移
+      ├─→ 立即移动（鼠标）
+      │    └── mousedown 未到达 Space → 不识别 pan → 不平移
+      │
+      ├─→ 立即移动（触摸/PointerEvent）
+      │    └── pointerdown 到达 Space → 正常识别 pan → 平移
       │
       └─→ 按住不动 ≥150ms
            ├── useLongPress 通过 pointerdown 检测到 → .dragging 类
@@ -661,9 +708,9 @@ const handleToggle = (event: React.MouseEvent) => {
       ├─→ 快速松开 (<150ms)
       │    └── 链接 onClick → stopPropagation（阻止 Node onClick）+ 浏览器打开 URL
       │
-      ├─→ 立即移动 (>5px)
+      ├─→ 立即移动（任何距离，threshold = 0）
       │    └── Space 识别 pan → 画布平移
-      │        链接 onClick 不触发（移动超过 click 判定阈值）
+      │        链接 onClick 不触发（移动超过浏览器 click 判定阈值）
       │
       └─→ 按住不动 ≥150ms
            ├── useLongPress 触发 → .dragging 类
@@ -682,7 +729,7 @@ const handleToggle = (event: React.MouseEvent) => {
                     ─────────────────────        ─────────────────           ─────────────────
   mousedown 到达    ✅ 是                         ❌ 否 (stopPropagation)    ✅ 是
   pointerdown 到达  ✅ 是                         ✅ 是                      ✅ 是
-  Space 可 pan      ✅ 是                         部分 (看输入类型)           ✅ 是
+  Space 可 pan      ✅ 是（鼠标+触摸）             ⚠️ 仅触摸/PointerEvent      ✅ 是
   useLongPress      ✅ 是                         ✅ 是 (通过 pointerdown)   ✅ 是
 
                     ┌─────────────────────────────────────────────────────────────┐
@@ -695,8 +742,8 @@ const handleToggle = (event: React.MouseEvent) => {
                            │                      │                      │
               区域1/3:     │         所有区域:      │         区域1/3:     │
               pointerdown  │         pointerdown    │         pointerdown  │
-              + move > 5px │         + 静止 ≥150ms  │         + 快速松开   │
-                           │                      │                      │
+              + 移动 > 0   │         + 静止 ≥150ms  │         + 快速松开   │
+              (threshold=0)│                      │                      │
                            ▼                      ▼                      ▼
                     ┌──────────────┐    ┌──────────────────┐      ┌──────────────┐
                     │ DRAGGING     │    │ LONG_PRESS       │      │ CLICK        │
@@ -716,9 +763,25 @@ const handleToggle = (event: React.MouseEvent) => {
 ```
 
 **DRAGGING 和 LONG_PRESS 的区别**：
-- **DRAGGING**：用户开始移动后，Space 直接识别 pan，此时 `.dragging` 类**可能还没加**（因为还没到 150ms），hover 副作用仍然存在
+- **DRAGGING**：用户开始移动后，Space 立即识别 pan（threshold = 0），此时 `.dragging` 类**可能还没加**（因为还没到 150ms），hover 副作用仍然存在
 - **LONG_PRESS**：用户按住不动 150ms 后，`.dragging` 类被加上，后续任何移动都是在"抑制状态"下进行的
 - 实际上两种模式可能**重叠**：先移动触发 DRAGGING，持续按住超 150ms 又触发 LONG_PRESS，此时 `.dragging` 类补上，消除之前未抑制的 hover 副作用
+
+---
+
+### 已删除的不准确断言
+
+在本次修正中，以下之前的不准确断言被删除或修正，因为通过外部依赖源码验证发现与事实不符：
+
+| 已删除的不准确断言 | 正确结论 | 证据来源 |
+|-------------------|---------|---------|
+| ❌ "hammerjs 默认 ~5px 拖拽阈值" | 🌐 react-zoomable-ui@0.11.0 显式设置 `pan threshold = 0`（ViewPort.js L408），覆盖了 hammerjs 默认的 10px | 外部依赖源码 |
+| ❌ "滚轮缩放 zoom±0.1" | 🌐 滚轮缩放使用动态步长 `dZoom = ((-1 * dy) / containerHeight) * zoomFactor`（ViewPort.js L341-L342）；±0.1 仅适用于工具栏按钮（✅ canvasHelpers.ts L257-L260） | 外部依赖源码 + 仓库源码 |
+| ❌ "useLongPress 监听 mouse 事件" | 🌐 use-long-press@3.3.0 默认 `detect: "pointer"`，监听 pointerdown/pointermove/pointerup/pointerleave | 外部依赖源码 |
+| ❌ "移动超过 click 判定阈值" | ⚠️ 浏览器 click 判定阈值未经验证，仅作推断标注，不做确定性断言 | 推断结论（待运行时验证） |
+| ❌ "Space 无法从按钮区域发起拖拽" | ⚠️ 鼠标拖拽因 `onMouseDown stopPropagation` 被阻断，但触摸/PointerEvent 可能仍然可用（取决于浏览器支持） | 仓库源码 + 推断结论 |
+
+> **证据边界说明**：所有被删除的断言都属于"无明确证据的推断"或"与外部依赖源码冲突"。修正后的结论严格按照 ✅ 仓库源码 / 🌐 外部依赖源码 / ⚠️ 推断结论 三类标记，确保读者能清楚区分哪些是已验证的事实，哪些是合理推断。
 
 ---
 
