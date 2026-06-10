@@ -2,18 +2,51 @@
 
 ## 一、系统架构概览
 
-JSON Crack 采用了**三层主题系统**协同工作的架构：
+JSON Crack 采用了**三层主题系统**协同工作的架构，同时通过**四条独立入口**（编辑器顶栏、画布偏好菜单、嵌入页 postMessage、VS Code / Chrome 扩展）驱动主题切换：
 
 | 层级 | 技术方案 | 覆盖范围 | 主题来源 |
 |------|----------|----------|----------|
-| UI 组件层 | Mantine UI + ColorSchemeManager | 按钮、弹窗、输入框等 Mantine 组件 | `mantineColorScheme.ts` |
-| 业务样式层 | styled-components + ThemeProvider | 编辑器布局、工具栏、树视图等自定义组件 | `constants/theme.ts` |
+| UI 组件层 | Mantine UI + ColorSchemeManager | 按钮、弹窗、输入框等 Mantine 组件 | `apps/www/src/lib/utils/mantineColorScheme.ts` |
+| 业务样式层 | styled-components + ThemeProvider | 编辑器布局、工具栏、树视图等自定义组件 | `apps/www/src/constants/theme.ts` |
 | 画布渲染层 | CSS Variables + inline style | JSON 图形画布（节点、连线、网格等） | `packages/jsoncrack-react/src/theme.ts` |
 
-关键文件定位：
-- 全局入口：[_app.tsx](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/apps/www/src/pages/_app.tsx#L1-L123)
-- 编辑器页面：[editor.tsx](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/apps/www/src/pages/editor.tsx#L1-L179)
-- 状态存储：[useConfig.ts](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/apps/www/src/store/useConfig.ts#L1-L33)
+### 关键文件索引（仓库相对路径）
+
+| 角色 | 仓库相对路径 |
+|------|-------------|
+| 全局入口 | `apps/www/src/pages/_app.tsx` |
+| 编辑器页面 | `apps/www/src/pages/editor.tsx` |
+| 嵌入页 | `apps/www/src/pages/widget.tsx` |
+| 文档页（嵌入 API 文档） | `apps/www/src/pages/docs.tsx` |
+| 状态存储 | `apps/www/src/store/useConfig.ts` |
+| Mantine 颜色方案管理器 | `apps/www/src/lib/utils/mantineColorScheme.ts` |
+| WWW 主题 Token 定义 | `apps/www/src/constants/theme.ts` |
+| styled-components 类型声明 | `apps/www/src/types/styled.d.ts` |
+| 全局基础样式 | `apps/www/src/constants/globalStyle.ts` |
+| 编辑器顶栏 ThemeToggle | `apps/www/src/features/editor/Toolbar/ThemeToggle.tsx` |
+| 编辑器顶栏主入口 | `apps/www/src/features/editor/Toolbar/index.tsx` |
+| 顶栏样式模板 | `apps/www/src/features/editor/Toolbar/styles.ts` |
+| 画布偏好菜单（含主题切换） | `apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx` |
+| GraphView 主组件 | `apps/www/src/features/editor/views/GraphView/index.tsx` |
+| Monaco 编辑器 | `apps/www/src/features/editor/TextEditor.tsx` |
+| LiveEditor 容器 | `apps/www/src/features/editor/LiveEditor.tsx` |
+| BottomBar | `apps/www/src/features/editor/BottomBar.tsx` |
+| 画布组件入口 | `packages/jsoncrack-react/src/JSONCrackComponent.tsx` |
+| 画布主题 Token | `packages/jsoncrack-react/src/theme.ts` |
+| 画布 CSS Variables 构建器 | `packages/jsoncrack-react/src/canvasHelpers.ts` |
+| 画布全局样式 | `packages/jsoncrack-react/src/JSONCrackStyles.module.css` |
+| 画布节点样式模块 | `packages/jsoncrack-react/src/components/Node.module.css` |
+| 节点颜色映射函数 | `packages/jsoncrack-react/src/components/nodeStyles.ts` |
+| ObjectNode 组件 | `packages/jsoncrack-react/src/components/ObjectNode.tsx` |
+| TextNode 组件 | `packages/jsoncrack-react/src/components/TextNode.tsx` |
+| CustomNode 组件 | `packages/jsoncrack-react/src/components/CustomNode.tsx` |
+| CustomEdge 组件 | `packages/jsoncrack-react/src/components/CustomEdge.tsx` |
+| Controls 组件 | `packages/jsoncrack-react/src/components/Controls.tsx` |
+| Controls 样式 | `packages/jsoncrack-react/src/components/Controls.module.css` |
+| 类型定义（含 CanvasThemeMode） | `packages/jsoncrack-react/src/types.ts` |
+| 包导出入口 | `packages/jsoncrack-react/src/index.ts` |
+| Chrome 扩展 content-script | `apps/chrome-extension/src/content-script.tsx` |
+| VS Code 扩展 App | `apps/vscode/src/App.tsx` |
 
 ---
 
@@ -23,7 +56,7 @@ JSON Crack 采用了**三层主题系统**协同工作的架构：
 
 主题状态的核心是 `darkmodeEnabled` 布尔值，存储在 Zustand 的 `useConfig` store 中：
 
-**文件**：[useConfig.ts](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/apps/www/src/store/useConfig.ts#L1-L33)
+**文件**：`apps/www/src/store/useConfig.ts`
 
 ```typescript
 const initialStates = {
@@ -53,20 +86,19 @@ const useConfig = create(
 - 自动将 store 状态序列化存储到 `localStorage["config"]`
 - 页面刷新时自动从 localStorage 恢复
 
-### 2.2 主题切换触发点：ThemeToggle 组件
+### 2.2 主题切换入口一：编辑器顶栏 ThemeToggle
 
-**文件**：[ThemeToggle.tsx](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/apps/www/src/features/editor/Toolbar/ThemeToggle.tsx#L1-L17)
+**文件**：`apps/www/src/features/editor/Toolbar/ThemeToggle.tsx`
 
 ```tsx
 export const ThemeToggle = () => {
-  // 读取状态（通过 selector 订阅，仅当 darkmodeEnabled 变化时重渲染）
   const darkmodeEnabled = useConfig(state => state.darkmodeEnabled);
   const toggleDarkMode = useConfig(state => state.toggleDarkMode);
 
   return (
     <StyledToolElement
       title={!darkmodeEnabled ? "Dark Mode" : "Light Mode"}
-      onClick={() => toggleDarkMode(!darkmodeEnabled)}  // 触发状态变更
+      onClick={() => toggleDarkMode(!darkmodeEnabled)}
     >
       {!darkmodeEnabled ? <FaMoon size="18" /> : <FaSun size="18" />}
     </StyledToolElement>
@@ -74,11 +106,206 @@ export const ThemeToggle = () => {
 };
 ```
 
-### 2.3 Mantine 专用：智能颜色方案管理器
+该组件位于编辑器页面**顶部工具栏右侧**（`Toolbar/index.tsx` L87），直接修改 Zustand store。
+
+### 2.3 主题切换入口二：画布偏好菜单（Preferences）
+
+**文件**：`apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx`（L281-L327）
+
+画布底部悬浮工具栏最右侧有一个齿轮图标（`LuSettings2`），点击展开 Preferences 菜单，其中包含主题切换项：
+
+```tsx
+<Menu trigger="click" position="top-end">
+  <Menu.Target>
+    <Tooltip label="Preferences" position="top" withArrow openDelay={750}>
+      <ActionIcon aria-label="preferences" size="lg" radius="md" variant="subtle" color="gray">
+        <LuSettings2 size={18} />
+      </ActionIcon>
+    </Tooltip>
+  </Menu.Target>
+  <Menu.Dropdown>
+    <Menu.Item
+      fz="sm"
+      leftSection={darkmodeEnabled ? <FaSun /> : <FaMoon />}
+      onClick={() => toggleDarkMode(!darkmodeEnabled)}  // 同样调用 useConfig.toggleDarkMode
+      closeMenuOnClick={false}
+    >
+      {darkmodeEnabled ? "Light Mode" : "Dark Mode"}
+    </Menu.Item>
+    <Menu.Item fz="sm" rightSection={<BsCheck2 display={gesturesEnabled ? "initial" : "none"} />}
+      onClick={() => toggleGestures(!gesturesEnabled)} closeMenuOnClick={false}>
+      Zoom on Scroll
+    </Menu.Item>
+    <Menu.Item fz="sm" rightSection={<BsCheck2 display={rulersEnabled ? "initial" : "none"} />}
+      onClick={() => toggleRulers(!rulersEnabled)} closeMenuOnClick={false}>
+      Rulers
+    </Menu.Item>
+  </Menu.Dropdown>
+</Menu>
+```
+
+**两个入口的统一性**：顶栏 `ThemeToggle` 和画布偏好菜单都调用同一个 `useConfig.toggleDarkMode()`，写入同一个 Zustand store，因此无论从哪个入口切换，三层主题系统的联动效果完全一致。
+
+### 2.4 主题切换入口三：嵌入页 postMessage
+
+**文件**：`apps/www/src/pages/widget.tsx`
+
+嵌入页（`/widget`）作为 iframe 被第三方网站嵌入时，通过 `window.postMessage` 接收外部传入的主题参数：
+
+```typescript
+interface EmbedMessage {
+  data: {
+    json?: string;
+    options?: {
+      theme?: "light" | "dark";
+      direction?: LayoutDirection;
+    };
+  };
+}
+```
+
+**消息监听与主题同步**（`widget.tsx` L56-L75）：
+
+```tsx
+React.useEffect(() => {
+  const handler = (event: EmbedMessage) => {
+    try {
+      if (!event.data?.json) return;
+      // 接收外部主题参数
+      if (event.data?.options?.theme === "light" || event.data?.options?.theme === "dark") {
+        setTheme(event.data.options.theme);             // 更新组件本地 state
+        toggleDarkMode(event.data.options.theme === "dark"); // 同步到 Zustand store
+      }
+      setContents({ contents: event.data.json, hasChanges: false });
+      setDirection(event.data.options?.direction || "RIGHT");
+    } catch (error) {
+      console.error(error);
+      toast.error("Invalid JSON!");
+    }
+  };
+
+  window.addEventListener("message", handler);
+  return () => window.removeEventListener("message", handler);
+}, [setColorScheme, setContents, setDirection, toggleDarkMode, theme]);
+```
+
+**Mantine 层同步**（`widget.tsx` L77-L79）：
+
+```tsx
+React.useEffect(() => {
+  setColorScheme(theme);  // 将本地 state 同步到 Mantine ColorScheme
+}, [setColorScheme, theme]);
+```
+
+**styled-components 层同步**（`widget.tsx` L82-L88）：
+
+```tsx
+<ThemeProvider theme={theme === "dark" ? darkTheme : lightTheme}>
+  <GraphView isWidget />
+</ThemeProvider>
+```
+
+**嵌入页 vs 编辑器页的关键差异**：
+
+| 对比项 | editor.tsx | widget.tsx |
+|--------|-----------|------------|
+| 主题来源 | Zustand store (`darkmodeEnabled`) | `postMessage` 外部传入 + Zustand store 双源 |
+| 本地 state | 无（直接读 store） | 有 `const [theme, setTheme] = useState<"dark" \| "light">("dark")` |
+| Mantine 同步 | `useEffect` 监听 `darkmodeEnabled` → `setColorScheme()` | `useEffect` 监听 `theme` state → `setColorScheme()` |
+| styled-components 同步 | `ThemeProvider theme={darkmodeEnabled ? darkTheme : lightTheme}` | `ThemeProvider theme={theme === "dark" ? darkTheme : lightTheme}` |
+| 画布主题传递 | `<JSONCrack theme={darkmodeEnabled ? "dark" : "light"}>` | `<GraphView isWidget>` → 内部同样读 `useConfig.darkmodeEnabled` |
+| 持久化 | Zustand persist → `localStorage["config"]` | 同样 Zustand persist（但每次 postMessage 都会覆盖） |
+
+**嵌入页的双向同步链路**：
+
+```
+外部父页面 postMessage({options: {theme: "light"}})
+   ↓
+widget.tsx handler 接收
+   ├─→ setTheme("light")              → 本地 state 更新
+   ├─→ toggleDarkMode(false)          → Zustand store.darkmodeEnabled = false
+   │     └─→ localStorage["config"] 持久化
+   │     └─→ GraphView 内部 selector 触发重渲染
+   │           └─→ <JSONCrack theme="light" />
+   ↓
+useEffect([theme]) 触发
+   └─→ setColorScheme("light")        → Mantine 层更新
+         └─→ localStorage["editor-color-scheme"] = "light"
+
+useEffect([theme]) 也触发 ThemeProvider 重渲染
+   └─→ <ThemeProvider theme={lightTheme}>  → styled-components 层更新
+```
+
+### 2.5 主题切换入口四：外部客户端（VS Code / Chrome 扩展）
+
+这两个客户端不使用 Zustand store，而是**直接读取宿主环境主题**，传递给 `<JSONCrack theme={...} />`：
+
+#### VS Code 扩展
+
+**文件**：`apps/vscode/src/App.tsx`（L15-L19, L56）
+
+```typescript
+function getTheme() {
+  const theme = document.body.getAttribute("data-vscode-theme-kind");
+  if (theme?.includes("light")) return "light" as const;
+  return "dark";
+}
+
+// 直接传给 JSONCrack，不经过任何 Zustand store
+<JSONCrack json={json} theme={theme} showControls={false} onNodeClick={handleNodeClick} />
+
+// Mantine 通过 forceColorScheme 锁定
+<MantineProvider forceColorScheme={theme}>
+```
+
+VS Code 扩展的特点：
+- 主题由 VS Code IDE 自身的颜色方案决定（`data-vscode-theme-kind` 属性）
+- 使用 `forceColorScheme` 而非 `ColorSchemeManager`，因为不需要用户手动切换
+- 没有提供用户可操作的主题切换 UI
+
+#### Chrome 扩展
+
+**文件**：`apps/chrome-extension/src/content-script.tsx`（L86-L103, L304-L363）
+
+```typescript
+function detectTheme(): ThemeMode {
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function useSystemTheme(): ThemeMode {
+  const [theme, setTheme] = useState<ThemeMode>(detectTheme);
+
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = (event: MediaQueryListEvent) => {
+      setTheme(event.matches ? "dark" : "light");
+    };
+    media.addEventListener("change", handler);
+    return () => media.removeEventListener("change", handler);
+  }, []);
+
+  return theme;
+}
+
+// 在 GraphView 中使用
+function GraphView({ rawJson }: { rawJson: string }) {
+  const theme = useSystemTheme();
+  // ...
+  return <JSONCrackComponent json={parsedJson} theme={theme} showControls showGrid centerOnLayout />;
+}
+```
+
+Chrome 扩展的特点：
+- 主题由**操作系统偏好**（`prefers-color-scheme`）决定
+- 实时监听系统主题变更（`media.addEventListener("change", handler)`）
+- 没有用户可操作的主题切换 UI（跟随系统）
+- 不使用 styled-components ThemeProvider 或 Mantine，仅使用 `jsoncrack-react` 包的 CSS Variables 机制
+
+### 2.6 Mantine 专用：智能颜色方案管理器
 
 为了实现**路径感知**的主题行为（编辑器页面用动态主题，营销页面强制浅色），项目自定义了 `smartColorSchemeManager`：
 
-**文件**：[mantineColorScheme.ts](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/apps/www/src/lib/utils/mantineColorScheme.ts#L1-L76)
+**文件**：`apps/www/src/lib/utils/mantineColorScheme.ts`
 
 核心逻辑：
 ```typescript
@@ -106,14 +333,14 @@ export function smartColorSchemeManager({
       currentColorScheme = value;
       window.localStorage.setItem(key, value);
     },
-    subscribe: () => {},  // 空实现，无需订阅
+    subscribe: () => {},
     unsubscribe: () => {},
     clear: () => { /* 清除内存和 localStorage */ },
   };
 }
 ```
 
-**动态路径配置**（[_app.tsx](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/apps/www/src/pages/_app.tsx#L74-L78)）：
+**动态路径配置**（`apps/www/src/pages/_app.tsx` L74-L78）：
 ```typescript
 const colorSchemeManager = smartColorSchemeManager({
   key: "editor-color-scheme",
@@ -128,7 +355,7 @@ const colorSchemeManager = smartColorSchemeManager({
 
 ### 3.1 全局入口初始化
 
-**文件**：[_app.tsx](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/apps/www/src/pages/_app.tsx#L91-L118)
+**文件**：`apps/www/src/pages/_app.tsx`
 
 ```tsx
 // Provider 嵌套层次（由外到内）：
@@ -139,36 +366,31 @@ const colorSchemeManager = smartColorSchemeManager({
 >
   <CodeHighlightAdapterProvider adapter={shikiAdapter}>
     <ThemeProvider theme={lightTheme}>       {/* 第2层：styled-components 主题（营销页面默认浅色）*/}
-      <GlobalStyle />                        {/* 全局基础样式 */}
+      <GlobalStyle />
       <Component {...pageProps} />           {/* 子页面可覆盖 ThemeProvider */}
     </ThemeProvider>
   </CodeHighlightAdapterProvider>
 </MantineProvider>
 ```
 
-**注意**：`_app.tsx` 中的 `ThemeProvider` 只设置了 `lightTheme`，这是营销页面的默认值。真正的动态切换在 `editor.tsx` 中重新覆盖。
+**注意**：`_app.tsx` 中的 `ThemeProvider` 只设置了 `lightTheme`，这是营销页面的默认值。真正的动态切换在 `editor.tsx` / `widget.tsx` 中重新覆盖。
 
 ### 3.2 编辑器页面的关键联动
 
-**文件**：[editor.tsx](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/apps/www/src/pages/editor.tsx#L102-L175)
+**文件**：`apps/www/src/pages/editor.tsx`
 
 这是串联三层系统的**核心节点**：
 
 ```tsx
 const EditorPage = () => {
-  // 1. 读取 store 中的主题状态
   const darkmodeEnabled = useConfig(state => state.darkmodeEnabled);
-
-  // 2. 获取 Mantine 的 setColorScheme API
   const { setColorScheme } = useMantineColorScheme();
 
-  // 3. 联动 Mantine 主题层
   useEffect(() => {
     setColorScheme(darkmodeEnabled ? "dark" : "light");
   }, [darkmodeEnabled, setColorScheme]);
 
   return (
-    // 4. 重新提供 styled-components ThemeProvider（覆盖 _app.tsx 中的 lightTheme）
     <ThemeProvider theme={darkmodeEnabled ? darkTheme : lightTheme}>
       <StyledPageWrapper>
         <Toolbar />
@@ -186,7 +408,7 @@ const EditorPage = () => {
 **联动关系**：
 
 ```
-用户点击 ThemeToggle
+用户点击 ThemeToggle / 偏好菜单主题项
    ↓
 useConfig.toggleDarkMode() 更新 Zustand store
    ↓
@@ -206,7 +428,7 @@ useConfig.toggleDarkMode() 更新 Zustand store
 
 ### 4.1 styled-components：主题对象 + CSS-in-JS
 
-**主题定义文件**：[theme.ts](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/apps/www/src/constants/theme.ts#L1-L114)
+**主题定义文件**：`apps/www/src/constants/theme.ts`
 
 主题对象结构：
 ```typescript
@@ -236,18 +458,32 @@ export const lightTheme = {
 };
 ```
 
-**消费方式**（以 [styles.ts](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/apps/www/src/features/editor/Toolbar/styles.ts#L1-L25) 为例）：
+**消费方式**（以 `apps/www/src/features/editor/Toolbar/styles.ts` 为例）：
 ```tsx
 export const StyledToolElement = styled.button<{ $hide?: boolean; $highlight?: boolean }>`
-  color: ${({ theme }) => theme.INTERACTIVE_NORMAL};    // 从 theme 对象读取
+  color: ${({ theme }) => theme.INTERACTIVE_NORMAL};
   
   &:hover {
-    color: ${({ theme }) => theme.INTERACTIVE_HOVER};   // 不同状态读取不同 Token
+    color: ${({ theme }) => theme.INTERACTIVE_HOVER};
   }
 `;
 ```
 
-**TypeScript 类型支持**：[styled.d.ts](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/apps/www/src/types/styled.d.ts#L1-L9)
+**间接消费 theme 判断亮暗**：部分组件通过 `theme.BACKGROUND_SECONDARY` 的值来判断当前是否浅色模式，用于条件样式：
+
+- `apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx` L26-L51（`glassSurface` 毛玻璃样式）
+- `apps/www/src/features/editor/views/GraphView/index.tsx` L31-L37（节点阴影颜色）
+- `apps/www/src/features/editor/BottomBar.tsx` L71-L73（hover 背景色）
+
+```tsx
+// GraphView/Toolbar/index.tsx 中的 glassSurface
+background: ${({ theme }) =>
+  theme.BACKGROUND_SECONDARY === "#f2f3f5"  // 用具体值判断是否浅色
+    ? "rgba(255, 255, 255, 0.72)"
+    : "rgba(28, 28, 30, 0.72)"};
+```
+
+**TypeScript 类型支持**：`apps/www/src/types/styled.d.ts`
 ```typescript
 import "styled-components";
 import type theme from "../constants/theme";
@@ -258,13 +494,12 @@ declare module "styled-components" {
   export interface DefaultTheme extends CustomTheme {}
 }
 ```
-这使得在 `styled.*` 中 `theme` 对象具有完整的类型提示。
 
 ### 4.2 JSONCrack 画布：CSS 自定义属性（CSS Variables）
 
 画布组件（`jsoncrack-react` 包）采用独立的主题系统，通过**内联 style 注入 CSS Variables**。
 
-**步骤 1：主题定义** - [packages/jsoncrack-react/src/theme.ts](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/packages/jsoncrack-react/src/theme.ts#L1-L71)
+**步骤 1：主题定义** - `packages/jsoncrack-react/src/theme.ts`
 ```typescript
 export const themes: Record<CanvasThemeMode, JSONCrackTheme> = {
   dark: {
@@ -280,7 +515,7 @@ export const themes: Record<CanvasThemeMode, JSONCrackTheme> = {
 };
 ```
 
-**步骤 2：构建 CSS Variables** - [canvasHelpers.ts](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/packages/jsoncrack-react/src/canvasHelpers.ts#L32-L65)
+**步骤 2：构建 CSS Variables** - `packages/jsoncrack-react/src/canvasHelpers.ts` L32-L65
 ```typescript
 export const buildCanvasStyle = (
   theme: CanvasThemeMode,
@@ -306,12 +541,10 @@ export const buildCanvasStyle = (
 };
 ```
 
-**步骤 3：注入到组件** - [JSONCrackComponent.tsx](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackComponent.tsx#L160-L165)
+**步骤 3：注入到组件** - `packages/jsoncrack-react/src/JSONCrackComponent.tsx` L161-L165
 ```tsx
-// 使用 useMemo 缓存，避免不必要的重算
 const canvasStyle = useMemo(() => buildCanvasStyle(theme, style), [theme, style]);
 
-// 通过 inline style 设置在容器 div 上
 return (
   <div ref={containerRef} style={canvasStyle} ... >
     {/* 内部子元素通过 CSS 变量读取颜色 */}
@@ -319,29 +552,18 @@ return (
 );
 ```
 
-**步骤 4：CSS 消费** - [JSONCrackStyles.module.css](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/packages/jsoncrack-react/src/JSONCrackStyles.module.css#L1-L75)
-```css
-.canvasWrapper {
-  background-color: var(--bg-color);
-}
+**步骤 4：CSS 消费** - `packages/jsoncrack-react/src/JSONCrackStyles.module.css`
 
-.showGrid {
-  background-image:
-    linear-gradient(var(--line-color-1) 1.5px, transparent 1.5px),
-    linear-gradient(90deg, var(--line-color-1) 1.5px, transparent 1.5px),
-    /* ... */;
-}
+| CSS 选择器 | 消费的变量 | 效果 |
+|-----------|-----------|------|
+| `.canvasWrapper` | `var(--bg-color)` | 画布背景色 |
+| `.showGrid` | `var(--line-color-1)`, `var(--line-color-2)` | 网格线颜色 |
+| `:global(text)` | `var(--interactive-normal)` | SVG 文字填充色 |
+| `:global(rect)` | `var(--node-fill)` | SVG 矩形填充色 |
+| `.spinner` | `var(--spinner-track)`, `var(--spinner-head)` | 加载指示器 |
 
-.canvasWrapper :global(text) {
-  fill: var(--interactive-normal) !important;
-}
+**步骤 5：DOM 元素行内消费** - `packages/jsoncrack-react/src/components/nodeStyles.ts`
 
-.canvasWrapper :global(rect) {
-  fill: var(--node-fill);
-}
-```
-
-**步骤 5：DOM 元素行内消费** - [nodeStyles.ts](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/packages/jsoncrack-react/src/components/nodeStyles.ts#L1-L13)
 ```typescript
 export const getTextColor = ({ type, value }: TextColorOptions) => {
   if (value === null) return "var(--node-null)";
@@ -351,14 +573,42 @@ export const getTextColor = ({ type, value }: TextColorOptions) => {
   if (value === false) return "var(--node-bool-false)";
   return "var(--node-value)";
 };
-
-// 在 ObjectNode.tsx 中使用：
-// <span style={{ color: getTextColor({ value: row.value, type: typeof row.value }) }}>
 ```
+
+**步骤 6：SVG 元素样式消费** - `packages/jsoncrack-react/src/components/CustomNode.tsx` & `CustomEdge.tsx`
+
+```tsx
+// CustomNode.tsx - 节点容器使用 CSS Variables
+<Node
+  style={{
+    fill: "var(--node-fill)",
+    stroke: "var(--node-stroke)",
+    strokeWidth: 1,
+  }}
+  onEnter={event => { event.currentTarget.style.stroke = "#3B82F6"; }}
+  onLeave={event => { event.currentTarget.style.stroke = "var(--node-stroke)"; }}
+/>
+
+// CustomEdge.tsx - 连线使用 CSS Variables
+<Edge
+  style={{
+    stroke: hovered ? "#3B82F6" : "var(--edge-stroke)",
+    strokeWidth: 1.5,
+  }}
+/>
+```
+
+**步骤 7：节点内行样式消费** - `packages/jsoncrack-react/src/components/Node.module.css`
+
+| CSS 类 | 消费的变量 | 效果 |
+|--------|-----------|------|
+| `.foreignObject` | `var(--node-text)` | 节点基础文字色 |
+| `.row` | `var(--node-divider)` | 行间分隔线 |
+| `.collapseButton` | `var(--interactive-normal)`, `var(--node-divider)` | 折叠按钮边框/文字 |
 
 ### 4.3 Monaco 编辑器：专有主题映射
 
-**文件**：[TextEditor.tsx](file:///d:/fz/0601/solo-dogfeeding/code/187-jsoncrack.com/apps/www/src/features/editor/TextEditor.tsx#L23-L96)
+**文件**：`apps/www/src/features/editor/TextEditor.tsx`
 
 Monaco 有自己的主题系统，通过简单的映射实现联动：
 ```tsx
@@ -367,7 +617,6 @@ const theme = useConfig(state => (state.darkmodeEnabled ? "vs-dark" : "light"));
 <Editor
   theme={theme}   // 直接传 Monaco 内置主题名
   language={fileType}
-  // ...
 />
 ```
 
@@ -375,7 +624,7 @@ const theme = useConfig(state => (state.darkmodeEnabled ? "vs-dark" : "light"));
 
 ## 五、完整响应链路时序分析
 
-### 场景：用户在编辑器页面点击主题切换按钮
+### 场景 A：编辑器页面 — 点击顶栏 ThemeToggle
 
 ```
 时间轴（从上到下）
@@ -391,41 +640,102 @@ const theme = useConfig(state => (state.darkmodeEnabled ? "vs-dark" : "light"));
 │   ├─ 3a. [EditorPage 重渲染]
 │   │   ├─ a1. <ThemeProvider theme={darkTheme/lightTheme}> 切换 theme 对象
 │   │   │   └─ styled-components 通知所有后代 styled.* 组件重新计算样式
-│   │   │       ├─ StyledEditor.background 重新取值 → 新的 BACKGROUND_SECONDARY
-│   │   │       ├─ StyledToolElement.color 重新取值 → 新的 INTERACTIVE_NORMAL
-│   │   │       └─ ... 所有使用 ${({theme}) => ...} 的样式全部重新计算
+│   │   │       ├─ StyledEditor.background → BACKGROUND_SECONDARY
+│   │   │       ├─ StyledToolElement.color → INTERACTIVE_NORMAL
+│   │   │       ├─ StyledBottomBar.border-bottom → BACKGROUND_MODIFIER_ACCENT
+│   │   │       ├─ StyledBottomBar.background → TOOLBAR_BG
+│   │   │       ├─ glassSurface (画布 Toolbar) → 条件判断 BACKGROUND_SECONDARY
+│   │   │       └─ ... 所有使用 ${({theme}) => ...} 的样式
 │   │   │
 │   │   └─ a2. useEffect 依赖 darkmodeEnabled 触发
-│   │       └─ setColorScheme(dark ? "dark" : "light")  → Mantine ColorSchemeManager
+│   │       └─ setColorScheme(dark ? "dark" : "light") → Mantine ColorSchemeManager
 │   │           ├─ smartColorSchemeManager.set()
 │   │           │   ├─ 更新内存中的 currentColorScheme
 │   │           │   └─ localStorage["editor-color-scheme"] = "dark"/"light"
 │   │           └─ MantineProvider 更新内部 colorScheme
-│   │               └─ 所有 Mantine 组件（Button/Modal/Tooltip...）应用新主题
+│   │               └─ 所有 Mantine 组件（Button/Modal/Tooltip/Menu/ActionIcon...）应用新主题
 │   │
-│   ├─ 3b. [GraphView 重渲染] - views/GraphView/index.tsx
+│   ├─ 3b. [GraphView 重渲染]
 │   │   └─ <JSONCrack theme={darkmodeEnabled ? "dark" : "light"} /> props 更新
-│   │       └─ JSONCrack 组件内部：
-│   │           ├─ useMemo(() => buildCanvasStyle(theme, style), [theme, style]) 重新执行
-│   │           │   └─ 生成包含 20+ 个 CSS Variables 的新 style 对象
-│   │           ├─ div[style=...] 重新应用 inline style
-│   │           │   └─ DOM 元素的 --bg-color / --node-fill / --node-key 等变量变更
-│   │           └─ 浏览器自动根据 CSS 变量重绘
-│   │               ├─ .canvasWrapper 的 background-color 随 --bg-color 更新
-│   │               ├─ :global(rect) 的 fill 随 --node-fill 更新
-│   │               ├─ 行内 span color 随 var(--node-key) 等更新
-│   │               └─ 网格线颜色、连线颜色、spinner 颜色等全部更新
+│   │       └─ useMemo(() => buildCanvasStyle(theme, style), [theme, style]) 重新执行
+│   │           └─ 生成包含 20+ 个 CSS Variables 的新 style 对象
+│   │               └─ div[style=...] 更新 inline style
+│   │                   └─ 浏览器根据 CSS 变量层叠重绘（无需 React 遍历节点）
 │   │
-│   └─ 3c. [TextEditor 重渲染] - TextEditor.tsx
-│       └─ theme 变量从 "vs-dark" 切换到 "light"（或反向）
-│           └─ Monaco Editor 内部切换主题（字体颜色、背景等）
+│   └─ 3c. [TextEditor 重渲染]
+│       └─ Monaco Editor theme="vs-dark"/"light" 切换
 │
-└─ 4. [渲染完成] 浏览器完成所有重绘，用户看到新主题
+└─ 4. [渲染完成]
+```
 
-备注：使用 useMemo 的地方：
-  - buildCanvasStyle(theme, style) → 避免非 theme 变更时重算
-  - useConfig(state => state.darkmodeEnabled) → 仅当该字段变化才触发组件重渲染
-  - styled-components 内部 diffing → 仅 theme 相关样式重新注入 class
+### 场景 B：编辑器页面 — 点击画布偏好菜单的主题项
+
+```
+时间轴（从上到下）
+│
+├─ 1. [用户交互] 点击画布底部工具栏齿轮图标 → 点击 "Dark Mode"/"Light Mode" 菜单项
+│
+├─ 2. [状态更新] useConfig.toggleDarkMode(!darkmodeEnabled)
+│
+└─ 3. 与场景 A 完全一致（同一个 Zustand store，同一个 toggleDarkMode）
+```
+
+### 场景 C：嵌入页 — 外部 postMessage 传入主题
+
+```
+时间轴（从上到下）
+│
+├─ 1. [外部消息] 父页面发送 postMessage({json: "...", options: {theme: "light"}})
+│
+├─ 2. [widget.tsx handler] 接收并同步
+│   ├─ setTheme("light")                          → 组件本地 state
+│   └─ toggleDarkMode(false)                      → Zustand store + localStorage["config"]
+│
+├─ 3. [Mantine 同步] useEffect([theme]) 触发
+│   └─ setColorScheme("light")
+│       └─ localStorage["editor-color-scheme"] = "light"
+│
+├─ 4. [styled-components 同步] ThemeProvider 读取 theme state
+│   └─ <ThemeProvider theme={lightTheme}>
+│
+├─ 5. [画布同步] GraphView 内部读 useConfig.darkmodeEnabled
+│   └─ <JSONCrack theme="light" />
+│       └─ buildCanvasStyle("light") → CSS Variables 更新
+│
+└─ 6. [渲染完成]
+```
+
+### 场景 D：Chrome 扩展 — 跟随系统主题
+
+```
+时间轴（从上到下）
+│
+├─ 1. [系统事件] 操作系统切换明暗模式
+│
+├─ 2. [useSystemTheme] MediaQueryList "change" 事件触发
+│   └─ setTheme(event.matches ? "dark" : "light")
+│
+├─ 3. [画布同步] GraphView 重渲染
+│   └─ <JSONCrackComponent theme={theme} />
+│       └─ buildCanvasStyle() → CSS Variables 更新
+│
+└─ 4. [渲染完成]
+    注意：Chrome 扩展不使用 Mantine/styled-components，仅依赖 CSS Variables
+```
+
+### 场景 E：VS Code 扩展 — 跟随 IDE 主题
+
+```
+时间轴（从上到下）
+│
+├─ 1. [页面加载] getTheme() 读取 data-vscode-theme-kind 属性
+│
+├─ 2. [Mantine 锁定] <MantineProvider forceColorScheme={theme}>
+│
+├─ 3. [画布同步] <JSONCrack theme={theme} />
+│
+└─ 4. [渲染完成]
+    注意：VS Code 扩展主题在页面加载时一次性确定，无运行时切换
 ```
 
 ---
@@ -450,25 +760,45 @@ const theme = useConfig(state => (state.darkmodeEnabled ? "vs-dark" : "light"));
 | `GRID_BG_COLOR` | `#141414` | `#f7f7f7` | 网格背景色 |
 | `GRID_COLOR_PRIMARY` | `#1c1b1b` | `#ebe8e8` | 主轴网格线 |
 | `MODAL_BACKGROUND` | `#36393E` | `#FFFFFF` | 弹窗背景 |
+| `SILVER_DARK` | `#4D4D4D` | `#CCCCCC` | 工具栏底部分隔线 |
 
 ### 6.2 画布 CSS Variables 对应表
 
-| CSS Variable | 来源 Token | 消费位置 |
-|--------------|------------|----------|
-| `--bg-color` | `GRID_BG_COLOR` | `.canvasWrapper` 背景 |
-| `--line-color-1` | `GRID_COLOR_PRIMARY` | 100px 大网格线 |
-| `--line-color-2` | `GRID_COLOR_SECONDARY` | 20px 小网格线 |
-| `--node-fill` | 动态计算 | SVG `<rect>` 填充 |
-| `--node-stroke` | 动态计算 | SVG `<rect>` 边框 |
-| `--node-text` | `NODE_COLORS.TEXT` | 普通文本 |
-| `--node-key` | `NODE_COLORS.NODE_KEY` | 对象 Key 文字 |
-| `--node-integer` | `NODE_COLORS.INTEGER` | 数字值 |
-| `--node-null` | `NODE_COLORS.NULL` | null 值 |
-| `--node-bool-true` | `NODE_COLORS.BOOL.TRUE` | true 值 |
-| `--node-bool-false` | `NODE_COLORS.BOOL.FALSE` | false 值 |
-| `--node-child-count` | `NODE_COLORS.CHILD_COUNT` | 子元素计数文字 |
-| `--node-divider` | `NODE_COLORS.DIVIDER` | 节点内分隔线 |
-| `--spinner-track` / `--spinner-head` | 动态计算 | 加载 spinner |
+| CSS Variable | 来源 Token | 消费位置（仓库相对路径） |
+|--------------|------------|--------------------------|
+| `--bg-color` | `GRID_BG_COLOR` | `packages/.../JSONCrackStyles.module.css` → `.canvasWrapper` 背景 |
+| `--line-color-1` | `GRID_COLOR_PRIMARY` | 同上 → `.showGrid` 大网格线 |
+| `--line-color-2` | `GRID_COLOR_SECONDARY` | 同上 → `.showGrid` 小网格线 |
+| `--edge-stroke` | 动态计算 | `packages/.../CustomEdge.tsx` → `<Edge style>` |
+| `--node-fill` | 动态计算 | `packages/.../CustomNode.tsx` → `<Node style>` + `JSONCrackStyles.module.css` → `:global(rect)` |
+| `--node-stroke` | 动态计算 | `packages/.../CustomNode.tsx` → `<Node style>` + `onLeave` 回调 |
+| `--interactive-normal` | `INTERACTIVE_NORMAL` | `JSONCrackStyles.module.css` → `:global(text)` + `Node.module.css` → `.collapseButton` |
+| `--background-node` | `BACKGROUND_NODE` | （预留，当前未直接消费） |
+| `--node-text` | `NODE_COLORS.TEXT` | `Node.module.css` → `.foreignObject` color |
+| `--node-key` | `NODE_COLORS.NODE_KEY` | `nodeStyles.ts` → `getTextColor` type=object |
+| `--node-value` | `NODE_COLORS.NODE_VALUE` | `nodeStyles.ts` → `getTextColor` 默认返回 |
+| `--node-integer` | `NODE_COLORS.INTEGER` | `nodeStyles.ts` → `getTextColor` type=number |
+| `--node-null` | `NODE_COLORS.NULL` | `nodeStyles.ts` → `getTextColor` value=null |
+| `--node-bool-true` | `NODE_COLORS.BOOL.TRUE` | `nodeStyles.ts` → `getTextColor` value=true |
+| `--node-bool-false` | `NODE_COLORS.BOOL.FALSE` | `nodeStyles.ts` → `getTextColor` value=false |
+| `--node-child-count` | `NODE_COLORS.CHILD_COUNT` | （预留，预留用于子元素计数） |
+| `--node-divider` | `NODE_COLORS.DIVIDER` | `Node.module.css` → `.row` border-bottom + `.collapseButton` border |
+| `--text-positive` | `TEXT_POSITIVE` | （预留） |
+| `--background-modifier-accent` | `BACKGROUND_MODIFIER_ACCENT` | （预留） |
+| `--spinner-track` / `--spinner-head` | 动态计算 | `JSONCrackStyles.module.css` → `.spinner` |
+| `--overlay-bg` | 动态计算 | （预留用于加载遮罩） |
+
+### 6.3 WWW 主题 vs 画布主题的 Token 差异
+
+`apps/www/src/constants/theme.ts` 和 `packages/jsoncrack-react/src/theme.ts` 定义了**两套独立的主题数据**，虽然部分颜色值重复，但用途不同：
+
+| 维度 | WWW 主题 (`constants/theme.ts`) | 画布主题 (`packages/.../theme.ts`) |
+|------|------|------|
+| 消费方式 | styled-components `theme` 对象 | CSS Variables `buildCanvasStyle()` |
+| 作用域 | 编辑器布局、工具栏、弹窗 | 画布内节点、连线、网格 |
+| 额外包含 | `TOOLBAR_BG`, `SILVER_DARK`, `MODAL_BACKGROUND` 等 UI Token | 无 UI Token，仅画布相关 |
+| 节点颜色 | `NODE_COLORS` 嵌套在 dark/light 中 | `NODE_COLORS` 作为顶层字段 |
+| 联动方式 | 由 `ThemeProvider` 切换 | 由 `theme` prop 传入 JSONCrack 后映射为 CSS Variables |
 
 ---
 
@@ -489,10 +819,10 @@ const { darkmodeEnabled } = useConfig();
 ### 7.2 useMemo 缓存计算
 
 ```tsx
-// JSONCrackComponent.tsx L161-165
+// packages/jsoncrack-react/src/JSONCrackComponent.tsx L161-165
 const canvasStyle = useMemo(
   () => buildCanvasStyle(theme, style),
-  [theme, style]  // 仅 theme 或 style 引用变化才重算
+  [theme, style]
 );
 ```
 
@@ -503,7 +833,11 @@ const canvasStyle = useMemo(
 - 浏览器自动层叠传播到所有后代
 - 无需逐个遍历节点触发 React 重渲染
 
-### 7.4 路径感知避免无关更新
+### 7.4 React.memo 避免不必要重渲染
+
+`ObjectNode` 和 `TextNode` 都使用 `React.memo` 做浅比较（`packages/jsoncrack-react/src/components/ObjectNode.tsx` L161-L168），当主题切换导致父组件重渲染时，如果节点数据未变则跳过重渲染。节点颜色完全通过 CSS Variables 层叠生效，不依赖 React props 传递。
+
+### 7.5 路径感知避免无关更新
 
 `smartColorSchemeManager` 确保营销页面（首页、文档）始终为 light，不受编辑器主题切换影响，避免这些页面不必要的重渲染。
 
@@ -511,7 +845,7 @@ const canvasStyle = useMemo(
 
 ## 八、双持久化机制说明
 
-项目存在两个独立的主题持久化存储：
+项目存在两个独立的主题持久化存储（仅限 `apps/www`）：
 
 | localStorage Key | 写入者 | 用途 | 格式 |
 |------------------|--------|------|------|
@@ -529,48 +863,104 @@ const canvasStyle = useMemo(
    ```
    即：**zustand store 是主数据源，Mantine 的 localStorage 是其派生镜像**。
 
+**嵌入页的额外同步**：`widget.tsx` 中同时维护一个本地 `theme` state，它通过 `postMessage` 写入、`toggleDarkMode` 同步回 Zustand store，并通过 `useEffect([theme])` 同步到 Mantine。
+
 ---
 
-## 九、架构图
+## 九、四入口统一架构图
 
 ```
-                        ┌──────────────────────────┐
-                        │  用户点击 ThemeToggle    │
-                        └────────────┬─────────────┘
-                                     │
-                                     ▼
-                        ┌──────────────────────────┐
-                        │   Zustand useConfig      │
-                        │   darkmodeEnabled: bool  │◄─────── localStorage["config"]
-                        │   (通过 persist 中间件)   │
-                        └──────────┬────┬──────────┘
-                                   │    │
-                    ┌──────────────┘    └─────────────────┐
-                    │                                       │
-                    ▼                                       ▼
-     ┌──────────────────────────────┐          ┌──────────────────────────┐
-     │    EditorPage 重渲染          │          │   GraphView 重渲染       │
-     │                              │          │                          │
-     │  ┌────────────────────────┐  │          │  JSONCrack theme prop    │
-     │  │ styled-components      │  │          │       │                  │
-     │  │ ThemeProvider 切换     │  │          │       ▼                  │
-     │  │ theme={darkTheme/light}│  │          │  buildCanvasStyle()      │
-     │  └───────────┬────────────┘  │          │  生成 CSS Variables     │
-     │              │               │          │       │                  │
-     │              ▼               │          │       ▼                  │
-     │  styled.* 组件样式重计算     │          │  容器 div inline style  │
-     │  (BACKGROUND_SECONDARY ...) │          │  (--bg-color 等 20+ 变量)│
-     └──────────────────────────────┘          └───────┬──────────────────┘
-                    │                                   │
-                    │  useEffect 触发                    └─── 浏览器 CSS 层叠生效
-                    ▼                                       画布重绘无需 React 遍历
-     ┌──────────────────────────────┐
-     │  Mantine setColorScheme()    │
-     │                              │
-     │  localStorage["editor-color- │
-     │  scheme"] = "dark"/"light"   │
-     │                              │
-     │  Mantine 组件主题切换         │
-     │  (Button/Modal/Loading...)   │
-     └──────────────────────────────┘
+              ┌─────────────────────────────────────────────────────────────────┐
+              │                    主题切换入口                                   │
+              ├──────────────┬───────────────────┬──────────────┬───────────────┤
+              │  入口 A       │  入口 B            │  入口 C       │  入口 D       │
+              │  顶栏Toggle  │  画布偏好菜单       │  postMessage │  外部客户端   │
+              │  ThemeToggle │  Preferences Menu  │  (嵌入页)     │  VS Code/    │
+              │              │                    │              │  Chrome      │
+              └──────┬───────┴────────┬──────────┴──────┬───────┴───────┬───────┘
+                     │                │                  │               │
+                     │                │                  │               │
+                     ▼                ▼                  ▼               ▼
+              ┌────────────┐  ┌────────────┐  ┌────────────────┐  ┌──────────────┐
+              │ useConfig  │  │ useConfig  │  │ widget.tsx     │  │ 环境原生主题  │
+              │ .toggle    │  │ .toggle    │  │ setTheme()     │  │              │
+              │ DarkMode() │  │ DarkMode() │  │ + toggleDark   │  │ VS Code:     │
+              │            │  │            │  │   Mode()       │  │ data-vscode- │
+              └─────┬──────┘  └─────┬──────┘  │                │  │ theme-kind   │
+                    │               │          │ Zustand store  │  │ Chrome:      │
+                    │               │          │ 同步更新        │  │ prefers-     │
+                    └───────┬───────┘          └───────┬────────┘  │ color-scheme │
+                            │                          │           └──────┬───────┘
+                            ▼                          │                  │
+                   ┌────────────────┐                  │                  │
+                   │ Zustand Store  │◄─────────────────┘                  │
+                   │ darkmodeEnabled│                                     │
+                   │ + persist →    │                                     │
+                   │ localStorage   │                                     │
+                   │ ["config"]     │                                     │
+                   └───┬────┬───┬───┘                                     │
+                       │    │   │                                         │
+          ┌────────────┘    │   └──────────────┐                          │
+          ▼                 ▼                  ▼                          ▼
+ ┌─────────────────┐ ┌──────────────┐ ┌───────────────┐      ┌───────────────────┐
+ │ ThemeProvider   │ │ GraphView    │ │ TextEditor    │      │ <JSONCrack        │
+ │ (styled-comp)   │ │ <JSONCrack   │ │ Monaco theme  │      │   theme={env}     │
+ │ darkTheme/      │ │  theme=      │ │ "vs-dark"/    │      │ />                │
+ │ lightTheme      │ │  dark/light  │ │ "light"       │      │ (无 Zustand,      │
+ └────────┬────────┘ └──────┬───────┘ └───────────────┘      │  直接环境主题)     │
+          │                 │                                 └────────┬──────────┘
+          ▼                 ▼                                          │
+ ┌─────────────────┐ ┌───────────────┐                                │
+ │ styled.* 组件   │ │ CSS Variables │◄───────────────────────────────┘
+ │ 重计算样式      │ │ 20+ 变量更新  │
+ └────────┬────────┘ └───────┬───────┘
+          │                  │
+          ▼                  ▼
+   ┌─────────────────────────────────┐
+   │      useEffect → Mantine        │
+   │      setColorScheme()           │
+   │      → localStorage            │
+   │        ["editor-color-scheme"]  │
+   │      → MantineProvider 更新     │
+   └─────────────────────────────────┘
 ```
+
+---
+
+## 十、嵌入 API 的主题参数规范
+
+**文件**：`apps/www/src/pages/docs.tsx`（L28-L58）
+
+文档页向外部用户展示了 postMessage API 的使用方式，其中 `options.theme` 是主题控制参数：
+
+```javascript
+// 父页面发送主题
+iframe.contentWindow.postMessage({
+  json: JSON.stringify({ hello: "world" }),
+  options: {
+    theme: "light",      // "light" | "dark"
+    direction: "DOWN"    // "RIGHT" | "DOWN" | "LEFT" | "UP"
+  }
+}, "*");
+```
+
+**就绪信号**：widget 页面加载后会向父页面回传自己的 iframe id：
+```typescript
+// widget.tsx L52
+window.parent.postMessage(window.frameElement?.getAttribute("id"), "*");
+```
+
+父页面需要先监听此信号再发送数据：
+```javascript
+window.addEventListener("message", (event) => {
+  if (event.data === "json-crack-embed") {
+    // Widget 就绪，可安全发送数据
+    iframe.contentWindow.postMessage({ ... }, "*");
+  }
+});
+```
+
+**主题参数的传递边界**：
+- `options.theme` 仅在 `postMessage` 中使用
+- Widget 页面接收后**立即同步**到 Zustand store（`toggleDarkMode`），确保所有三层主题系统一致更新
+- 后续用户在 widget 内通过 UI 切换主题时，会覆盖外部传入的值
