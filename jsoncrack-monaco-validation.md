@@ -857,3 +857,230 @@ Widget 虽然通过 `postMessage` 接收外部数据，但最终调用了 `useFi
 2. **双重校验源竞争**：Monaco `onValidate` 和 `contentToJson` catch 都写 `useFile.error`，时序不确定，可能互相覆盖
 3. **Valid 闪烁**：`setContents` 入口先设 `error: null`，随后 catch 再设回错误消息，造成 BottomBar 瞬时 Valid 闪烁
 4. **错误回调未连接**：`JSONCrack` 提供了 `onParseError` 回调，但 `GraphView` 没有传入，第二层错误完全静默
+
+---
+
+## 10. 空输入（空字符串）场景深度分析
+
+"清空编辑器内容"是一个看似简单但实际行为极其微妙的场景。关键在于 [useFile.ts L103](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L103) 的短路判断被忽略了。
+
+### 10.1 入口：空字符串是否会进入输入回调？
+
+**答案：会。**
+
+[TextEditor.tsx L90](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/features/editor/TextEditor.tsx#L90)：
+```tsx
+onChange={contents => setContents({ contents, skipUpdate: true })}
+```
+
+当用户在编辑器中选中所有内容并删除（Ctrl+A → Delete），或者逐字删除到最后一个字符，Monaco Editor 会将编辑器的完整内容作为 `contents` 参数传给 `onChange` 回调。当编辑器完全为空时，`contents === ""`（空字符串），这个回调会**正常触发**，不会被跳过。
+
+所以调用链路是：
+```
+用户清空编辑器 → Monaco onChange(contents = "")
+  → setContents({ contents: "", skipUpdate: true })
+```
+
+### 10.2 关键点：空字符串是否会被写入 `useFile.contents`？
+
+**答案：不会。这是理解整个场景的核心。**
+
+[useFile.ts L102-L107](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L102-L107)：
+```ts
+set({
+  ...(contents && { contents }),   // ← 短路判断！
+  error: null,
+  hasChanges,
+  format: format ?? get().format,
+});
+```
+
+这里使用了对象展开 + 短路运算符 `&&`。由于空字符串 `""` 在 JavaScript 中是 **falsy 值**，`contents && { contents }` 的结果是 `""`（不是对象），被展开运算符 `...` 展开时相当于什么都没做。
+
+等价于：
+```js
+if (contents) {  // "" 是 falsy，条件为 false
+  set({ contents, error: null, ... });
+} else {
+  set({ error: null, hasChanges, format: ... });  // ← 实际执行的是这个！
+}
+```
+
+**结论**：当 `contents === ""` 时，`useFile.contents` **不会被更新**，仍然保持上一次成功写入的值（比如 `"{\n  \"name\": \"Alice\"\n}"`）。
+
+这也影响到 sessionStorage 的写入条件：
+```ts
+// [useFile.ts L114]
+if (get().hasChanges && contents && contents.length < 80_000 && ...) {
+  sessionStorage.setItem("content", contents);  // ← 空字符串也不会写入 session
+}
+```
+
+### 10.3 空输入时解析的是什么内容？
+
+**答案：解析的是上一次成功写入的旧内容，而不是空字符串。**
+
+[useFile.ts L110](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L110)：
+```ts
+const json = await contentToJson(get().contents, get().format);
+```
+
+由于第 10.2 步中 `useFile.contents` 没有被更新，`get().contents` 返回的仍然是旧值。所以：
+
+```
+contentToJson(旧内容, 当前格式)
+  → 旧内容是有效的 JSON
+  → 解析成功，返回旧对象
+  → debouncedUpdateJson(旧对象)
+  → useJson.json = "{\n  \"name\": \"Alice\"\n}"  (不变，和之前一样)
+```
+
+> 注意：[jsonAdapter.ts L5](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/lib/utils/jsonAdapter.ts#L5) 的 `if (!value) return {}` 分支**不会被触发**，因为 `get().contents` 根本就不是空字符串。
+
+### 10.4 空输入时画布数据是否会变更？
+
+**答案：不会。useJson.json 保持旧值，画布保留旧图。**
+
+由于 `contentToJson` 解析的是旧内容，返回的是旧对象，`debouncedUpdateJson` 虽然会被调用，但设置的是和之前**完全相同**的 JSON 字符串。
+
+React 的 useEffect 依赖 `jsonText`（`toJsonText(json)` 的结果），新旧值相同的话，useEffect 不会触发，JSONCrack 内部的 nodes/edges 完全不受影响。
+
+### 10.5 空输入时编辑器 UI 是否会变更？
+
+**答案：会。Monaco Editor 显示为空，但状态不同步。**
+
+这里有一个受控/非受控的微妙问题：
+
+[TextEditor.tsx L86](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/features/editor/TextEditor.tsx#L86)：
+```tsx
+<Editor
+  value={contents}   // ← 来自 useFile(state => state.contents)
+  ...
+/>
+```
+
+`useFile.contents` 没有被更新（仍然是旧值），所以理论上 `value` prop 还是旧值。但 Monaco Editor 的实际行为取决于 `@monaco-editor/react` 内部实现：
+
+- Monaco 编辑器内部维护了自己的文档模型（`ITextModel`），用户的输入操作直接作用在内部模型上
+- `value` prop 是受控属性，当 prop 变化时会同步到内部模型
+- 但如果用户操作导致内部模型变化，而 `value` prop 没变（因为短路判断没写入），此时可能出现**内部模型是空的，但受控 value 还是旧值**的不一致状态
+
+实际上，在 React 受控组件语义下，如果 `value` prop 确实被设为旧值，Monaco 应该会在下次渲染时把编辑器内容恢复成旧值。但这取决于组件内部的实现细节，可能表现为：
+- 用户删除完后编辑器立刻显示为空
+- 下一帧 React 渲染时，由于 `value={oldValue}`，编辑器可能又恢复旧内容
+- 或者 Monaco 内部有自己的判断逻辑
+
+不管 Monaco UI 的实际表现如何，从数据流的角度看：**`useFile.contents` 保持旧值，`useJson.json` 保持旧值，画布不受影响**。
+
+### 10.6 空输入时 BottomBar 状态
+
+| 步骤 | 操作 | useFile.error | BottomBar 显示 |
+|------|------|---------------|---------------|
+| 1 | 清空前 | `null`（或之前的错误） | 取决于之前状态 |
+| 2 | `setContents` try 块入口 | 被设为 `null` | Valid（瞬时） |
+| 3 | Monaco `onValidate` 回调 | 取决于 Monaco 对空内容的校验 | 可能 Valid（空内容可能不触发语法错误） |
+| 4 | `contentToJson(旧内容)` 成功 | 保持 `null` | Valid |
+
+**最终 BottomBar 显示 Valid**，因为：
+- try 块入口已经设 `error: null`
+- `contentToJson` 解析旧内容成功，没有进 catch
+- Monaco 对空内容的校验通常不会报语法错误（空是合法的或被忽略）
+
+### 10.7 空输入场景完整时序图
+
+```
+用户全选删除编辑器内容
+   │
+   ├─ Monaco UI：显示为空（内部模型变为 ""）
+   │
+   ├─ Monaco onChange 触发 → contents = ""
+   │     │
+   │     └─ setContents({ contents: "", skipUpdate: true })
+   │           │
+   │           ├─ ① setState 展开短路判断
+   │           │     ...("" && { contents: "" })  →  什么都不展开
+   │           │     → useFile.contents 保持旧值（如 "{\n  \"a\": 1\n}"）
+   │           │     → 只更新 error: null, hasChanges: true
+   │           │
+   │           ├─ ② BottomBar 瞬时显示 Valid
+   │           │
+   │           └─ ③ contentToJson(get().contents, format)
+   │                 = contentToJson("{\n  \"a\": 1\n}", "json")
+   │                 → 解析成功，返回 { a: 1 }
+   │                 → debouncedUpdateJson({ a: 1 })
+   │                 → 400ms 后 useJson.json = "{\n  \"a\": 1\n}"
+   │                   （和之前完全相同，useEffect 不触发）
+   │                 → ✅ 画布保留旧图
+   │
+   └─ Monaco onValidate（稍后）
+         → 空内容通常无语法错误
+         → setError("")
+         → BottomBar 仍显示 Valid
+```
+
+### 10.8 真正能清空内容的路径：`useFile.clear()`
+
+通过 `setContents({ contents: "" })` 无法清空 `useFile.contents`，但项目中有专门的 `clear()` 方法可以做到：
+
+[useFile.ts L73-L76](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L73-L76)：
+```ts
+clear: () => {
+  set({ contents: "" });          // ← 直接 set，没有短路判断！
+  useJson.getState().clear();     // ← 同时清空 useJson
+},
+```
+
+[useJson.ts L22-L24](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useJson.ts#L22-L24)：
+```ts
+clear: () => {
+  set({ json: "", loading: false });
+},
+```
+
+`clear()` 被调用的场景：
+- `fetchUrl` 失败时（[useFile.ts L138](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L138)）
+- `setFormat` 转换格式失败时（[useFile.ts L96](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L96)）
+
+`clear()` 触发后的行为与"编辑器清空"完全不同：
+- `useFile.contents = ""`（真正被清空了）
+- `useJson.json = ""`（被设为空字符串）
+- JSONCrack 的 `json` prop 变为 `""` → `toJsonText("")` 返回 `""`
+- 第二层 `parseJsonGraph("", ...)` 被调用
+  - `parseTree("")` 返回 `null`
+  - `parseGraph` 返回 `{ nodes: [], edges: [], errors: [...] }`
+  - `kind: "ok"`, `syntaxErrorCount > 0`, `nodes.length === 0`
+  - `setNodes([])`, `setEdges([])`
+- 画布变为空白（不是保留旧图）
+
+### 10.9 两种"清空"路径对比表
+
+| 维度 | 编辑器清空（Ctrl+A Delete） | `useFile.clear()` 调用 |
+|------|--------------------------|----------------------|
+| 触发方式 | 用户操作编辑器 | 代码主动调用 |
+| `useFile.contents` | ❌ 保持旧值（短路判断拦截） | ✅ 变为 `""` |
+| `useJson.json` | ✅ 保持旧值（contentToJson 解析旧内容，结果相同） | ✅ 变为 `""` |
+| `contentToJson` 入参 | 旧内容字符串 | 根本不经过 contentToJson |
+| 第二层是否触发 | 否（jsonText 不变，useEffect 不触发） | 是（jsonText 变为 `""`） |
+| 画布状态 | **保留旧图**（完全不动） | **清空为空白**（nodes = []） |
+| BottomBar | Valid | Valid（无错误设置） |
+| Monaco UI | 可能为空（取决于受控同步） | 变为空（value prop 更新为 `""`） |
+
+### 10.10 Bug 分析
+
+[useFile.ts L103](file:///d:/fz/0601/solo-dogfeeding/code/183-jsoncrack.com/apps/www/src/store/useFile.ts#L103) 的短路判断 `...(contents && { contents })` 存在以下问题：
+
+1. **空字符串无法通过正常输入路径写入**：用户清空编辑器后，`useFile.contents` 和 Monaco UI 可能不同步
+2. **意图与实际行为不一致**：开发者可能想通过 `setContents({ contents: "" })` 清空内容，但实际上做不到
+3. **与 `clear()` 行为不一致**：同样是把内容设为空，不同路径结果完全不同
+4. **`hasChanges` 标记错误**：空输入时 `hasChanges` 被设为 `true`，但实际上数据根本没变
+
+如果开发者希望空字符串能被正常写入，应该将短路判断改为显式判断：
+```ts
+// 原来：
+...(contents && { contents }),
+
+// 改为：
+...(contents !== undefined && { contents }),
+```
+
+这样只有当 `contents` 参数**未传入**（`undefined`）时才跳过，传入空字符串 `""` 时会正常写入。
