@@ -398,14 +398,16 @@ window.addEventListener("message", (event) => {
 ```typescript
 interface EmbedMessage {
   data: {
-    json?: string;           // JSON 字符串
+    json: string;            // ⚠️ 必需字段！没有则整条消息被忽略
     options?: {
-      theme?: "light" | "dark";      // 主题
-      direction?: LayoutDirection;   // 布局方向: "RIGHT" | "DOWN" | "LEFT" | "UP"
+      theme?: "light" | "dark";      // 可选：主题
+      direction?: LayoutDirection;   // 可选：布局方向 "RIGHT" | "DOWN" | "LEFT" | "UP"
     };
   };
 }
 ```
+
+> **重要提示**: 虽然 TypeScript 接口中 `json` 在运行时是必需的，但如果为 falsy 值（空字符串、null、undefined 等），整条消息会被静默忽略，不会有任何错误提示。
 
 ### 4.4 内容下发的完整链路
 
@@ -415,6 +417,7 @@ interface EmbedMessage {
 React.useEffect(() => {
   const handler = (event: EmbedMessage) => {
     try {
+      // ⚠️ 关键前置条件：必须有 json 字段，否则直接返回
       if (!event.data?.json) return;
       
       // 1. 内容更新
@@ -439,32 +442,67 @@ React.useEffect(() => {
 }, [setColorScheme, setContents, setDirection, toggleDarkMode, theme]);
 ```
 
-**内容下发链路**:
+#### 4.4.1 前置条件：json 字段是所有处理的入口
+
+**代码位置**: [widget.tsx L59](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L59)
+
+```typescript
+if (!event.data?.json) return;
+```
+
+这行代码是整个消息处理的**守门人**：
+- 如果 `event.data.json` 不存在、为 `null`、`undefined` 或空字符串等 falsy 值
+- **整个 handler 函数直接 return**
+- 后续的内容更新、布局方向更新、**主题更新全部被跳过**
+- 没有任何日志或提示，消息被静默忽略
+
+#### 4.4.2 内容下发完整链路
+
 ```
 父窗口 postMessage({ json, options })
     ↓
 Widget message 事件触发
     ↓
-┌─ handler 函数 ─────────────────────────────┐
-│  1. 校验 event.data.json 存在               │
-│  2. 调用 useFile.setContents()             │
+┌─ 前置校验 ─────────────────────────────────┐
+│  if (!event.data?.json) return;            │
+│  ❌ 无 json → 直接忽略，什么都不做          │
+│  ✅ 有 json → 继续处理                      │
+└─────────────────────────────────────────────┘
+    ↓
+┌─ handler 函数主体 ─────────────────────────┐
+│  1. 调用 useFile.setContents()             │
 │     ├─ 更新内存状态 contents                │
 │     ├─ hasChanges 设为 false（不持久化）    │
 │     └─ 防抖调用 useJson.setJson()           │
-│  3. 调用 useGraph.setDirection()            │
-│  4. 主题更新（见下文）                      │
+│  2. 调用 useGraph.setDirection()            │
+│  3. 主题更新（见下文）                      │
 └─────────────────────────────────────────────┘
     ↓
 GraphView 重新渲染
 ```
 
+#### 4.4.3 消息有效性判断表
+
+| 消息内容 | 是否有效 | 说明 |
+|---------|---------|------|
+| `{ json: "{}" }` | ✅ 有效 | 只有内容，使用默认布局方向和当前主题 |
+| `{ json: "{}", options: {} }` | ✅ 有效 | 有内容，options 为空，使用默认值 |
+| `{ json: "{}", options: { theme: "dark" } }` | ✅ 有效 | 有内容 + 主题，主题会被处理 |
+| `{ json: "{}", options: { direction: "DOWN" } }` | ✅ 有效 | 有内容 + 布局方向，方向会被处理 |
+| `{ json: "{}", options: { theme: "dark", direction: "DOWN" } }` | ✅ 有效 | 有内容 + 主题 + 方向，全部处理 |
+| `{ options: { theme: "dark" } }` | ❌ 无效 | 没有 json 字段，**全部忽略** |
+| `{ options: { direction: "DOWN" } }` | ❌ 无效 | 没有 json 字段，**全部忽略** |
+| `{ json: "" }` | ❌ 无效 | json 为空字符串（falsy），**全部忽略** |
+| `{ json: null }` | ❌ 无效 | json 为 null，**全部忽略** |
+
 **关键点**: 
 - 父页面下发的内容 `hasChanges` 被强制设为 `false`，**不会写入 sessionStorage**
 - Widget 模式下禁用了 sessionStorage 恢复，确保内容完全由父页面控制
+- ⚠️ **主题和布局方向不能单独下发，必须附带 json 字段**
 
 ### 4.5 主题下发的完整链路
 
-主题下发涉及**三层状态同步**，是最复杂的部分：
+主题下发涉及**三层状态同步**，但最重要的边界是：**主题不能单独下发，必须附带 json 字段**。
 
 #### 4.5.1 三层主题状态
 
@@ -474,21 +512,54 @@ GraphView 重新渲染
 | 2 | `darkmodeEnabled` | localStorage "config" | useConfig (Zustand) |
 | 3 | `colorScheme` | localStorage "editor-color-scheme" | Mantine 管理器 |
 
-#### 4.5.2 主题下发完整流程
+#### 4.5.2 主题下发的前置条件
+
+**关键边界**: [widget.tsx L59](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L59) 的 `if (!event.data?.json) return;` 意味着：
+
+- ❌ **单独发送主题配置会被静默忽略**
+- ✅ **必须同时发送 json 字段，主题才会被处理**
+
+**错误示例**（不会生效）:
+```typescript
+// ❌ 没有 json 字段，主题更新被完全忽略
+iframe.contentWindow.postMessage({
+  options: { theme: "dark" }
+}, "*");
+```
+
+**正确示例**:
+```typescript
+// ✅ 附带 json 字段，主题更新才会生效
+iframe.contentWindow.postMessage({
+  json: JSON.stringify({ hello: "world" }),  // 必须有
+  options: { theme: "dark" }
+}, "*");
+```
+
+#### 4.5.3 主题下发完整流程
 
 ```
-父窗口 postMessage({ options: { theme: "dark" } })
+父窗口 postMessage({ json: "...", options: { theme: "dark" } })
     ↓
 Widget message 事件触发
     ↓
+┌─ 前置校验 ─────────────────────────────────┐
+│  if (!event.data?.json) return;            │
+│  ❌ 无 json → 直接忽略，主题也不处理        │
+│  ✅ 有 json → 继续处理                      │
+└─────────────────────────────────────────────┘
+    ↓
 ┌─ handler 函数 ─────────────────────────────────┐
-│  1. setTheme("dark")                            │
-│     └─ 更新本地 useState → 触发 useEffect       │
-│  2. toggleDarkMode(true)                        │
-│     └─ useConfig 更新                           │
-│        ├─ 更新内存 darkmodeEnabled = true       │
-│        └─ Zustand persist 写入 localStorage    │
-│           key: "config"                         │
+│  1. setContents({ contents: json, ... })        │
+│  2. setDirection(...)                           │
+│  3. 主题更新（仅当 options.theme 存在时）       │
+│     ├─ setTheme("dark")                         │
+│     │  └─ 更新本地 useState → 触发 useEffect    │
+│     └─ toggleDarkMode(true)                     │
+│        └─ useConfig 更新                        │
+│           ├─ 更新内存 darkmodeEnabled = true    │
+│           └─ Zustand persist 写入 localStorage │
+│              key: "config"                      │
 └─────────────────────────────────────────────────┘
     ↓
 useEffect 触发（theme 依赖）
@@ -511,22 +582,27 @@ UI 重新渲染
 **代码实现**:
 
 ```typescript
-// 步骤1: message handler 中更新
+// handler 中的处理逻辑
+if (!event.data?.json) return;  // ⚠️ 没有 json 直接返回
+
+// ... 内容更新和方向更新 ...
+
+// 主题更新：必须先通过 json 校验才能到达这里
 if (event.data?.options?.theme === "light" || event.data?.options?.theme === "dark") {
   setTheme(event.data.options.theme);              // 更新本地 state
   toggleDarkMode(event.data.options.theme === "dark");  // 更新 useConfig
 }
 
-// 步骤2: useEffect 同步到 Mantine
+// useEffect 同步到 Mantine
 React.useEffect(() => {
   setColorScheme(theme);
 }, [setColorScheme, theme]);
 
-// 步骤3: ThemeProvider 消费
+// ThemeProvider 消费
 <ThemeProvider theme={theme === "dark" ? darkTheme : lightTheme}>
 ```
 
-#### 4.5.3 主题同步的潜在问题
+#### 4.5.4 主题同步的潜在问题
 
 1. **三层状态可能不一致**:
    - 如果 `setColorScheme` 失败，本地 `theme` state 和 `darkmodeEnabled` 已更新，但 Mantine 主题未变
@@ -541,6 +617,40 @@ React.useEffect(() => {
    - `smartColorSchemeManager` 的 `currentColorScheme` 内存缓存
    - 如果其他代码直接修改 localStorage，Mantine 不会感知
    - 必须通过 `setColorScheme` API 更新才能保证一致性
+
+4. **主题无法独立切换**:
+   - 只想切换主题时，必须重新发送完整的 JSON 内容
+   - 增加了消息开销，且父页面必须维护当前 JSON 内容的副本
+   - 如果父页面丢失了当前 JSON 内容，就无法单独切换主题
+
+#### 4.5.5 此边界对嵌入页面同步链路的影响
+
+| 影响场景 | 具体表现 |
+|---------|---------|
+| **主题独立切换** | ❌ 无法实现，必须附带完整 JSON 内容 |
+| **布局方向独立切换** | ❌ 无法实现，必须附带完整 JSON 内容 |
+| **动态主题跟随系统** | ❌ 父页面监听系统主题变化后，必须重发 JSON 才能更新 Widget 主题 |
+| **多 Widget 同步主题** | ❌ 每个 Widget 都需要父页面单独发送带 JSON 的消息 |
+| **消息大小** | ⚠️ 每次切换主题都要传输完整 JSON，增加带宽开销 |
+| **父页面复杂度** | ⚠️ 父页面必须缓存当前的 JSON 内容，以便在切换主题时重新发送 |
+
+**典型的父页面实现复杂度**:
+```typescript
+// 父页面必须缓存当前的 JSON 内容
+let currentJson = JSON.stringify({ hello: "world" });
+
+// 切换主题时，必须重新发送完整的 JSON
+function changeTheme(newTheme) {
+  // ❌ 不能只发主题
+  // iframe.contentWindow.postMessage({ options: { theme: newTheme } }, "*");
+  
+  // ✅ 必须附带完整的 JSON
+  iframe.contentWindow.postMessage({
+    json: currentJson,  // 必须有，父页面必须维护这个状态
+    options: { theme: newTheme }
+  }, "*");
+}
+```
 
 ---
 
@@ -643,3 +753,23 @@ useConfig.toggleDarkMode(value)
 | Widget ↔ 父页面 | postMessage | ✅ | 父→子单向实时同步，子→父仅初始化时发送 ready 信号 |
 | 多标签页 Widget | 无 | ❌ | 每个 iframe 独立，完全由各自父页面控制 |
 | Editor ↔ Widget | 无 | ❌ | 即使同源打开，也无任何同步机制 |
+
+### 7.4 Widget 消息处理的关键边界
+
+| 边界条件 | 代码位置 | 影响 |
+|---------|---------|------|
+| **json 字段前置校验** | [widget.tsx L59](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L59) | 所有消息必须包含 json 字段，否则被静默忽略 |
+| **主题不能独立下发** | [widget.tsx L59-L63](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L59-L63) | 切换主题必须附带完整 JSON 内容，增加父页面复杂度 |
+| **布局方向不能独立下发** | [widget.tsx L59+L65](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L59) | 切换布局方向必须附带完整 JSON 内容 |
+| **hasChanges=false** | [widget.tsx L65](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L65) | 父页面下发的内容不会写入 sessionStorage |
+
+**关键代码**（消息处理的守门人）:
+```typescript
+// widget.tsx L59
+if (!event.data?.json) return;  // ⚠️ 没有 json 字段，直接忽略整条消息
+```
+
+**父页面实现要求**:
+1. 必须缓存当前的 JSON 内容
+2. 切换主题/布局方向时，必须重新发送完整的 JSON + 新配置
+3. 无法实现纯配置更新（如只切换主题不更新内容）
