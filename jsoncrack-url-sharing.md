@@ -566,12 +566,286 @@ const data = JSON.parse(pako.inflateRaw(compressed, { to: 'string' }));
 
 ---
 
+## 十一、URL 导入入口 vs 地址参数入口：代码实现差异分析
+
+### 11.1 两条远程加载路径概述
+
+JSON Crack 中存在**两条独立的远程数据加载路径**，它们的触发时机、代码位置和对本地缓存的影响完全不同：
+
+| 路径名称 | 触发方式 | 核心文件 | 调用入口 |
+|----------|---------|----------|---------|
+| **地址参数入口** | 用户访问带参数的 URL：`/editor?json=<URL>` | [editor.tsx](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/pages/editor.tsx) | `useEffect` → `checkEditorSession(query.json)` |
+| **URL 导入入口** | 用户在编辑器内通过 ImportModal 手动输入 URL | [ImportModal/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/features/modals/ImportModal/index.tsx) | `handleImportFile()` → `fetch(url)` |
+
+---
+
+### 11.2 地址参数入口的代码实现
+
+**入口位置**：[editor.tsx#L103-L117](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/pages/editor.tsx#L103-L117)
+
+```typescript
+const EditorPage = () => {
+  const { query, isReady } = useRouter();
+  const checkEditorSession = useFile(state => state.checkEditorSession);
+
+  // 页面初始化时自动触发
+  useEffect(() => {
+    if (isReady) checkEditorSession(query?.json);
+  }, [checkEditorSession, isReady, query]);
+};
+```
+
+**调用链路**：
+```
+页面加载 → useEffect 自动触发
+     │
+     ▼
+checkEditorSession(url, widget=false)
+     │
+     ▼
+isURL(url) 正则校验通过
+     │
+     ▼
+fetchUrl(url)   ← useFile store 内部方法
+     │
+     ▼
+get().setContents({ contents: jsonStr })
+```
+
+**关键代码**：[useFile.ts#L142-L145](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts#L142-L145)
+```typescript
+checkEditorSession: (url, widget) => {
+  if (url && typeof url === "string" && isURL(url)) {
+    return get().fetchUrl(url);  // 通过 store 内部的 fetchUrl 方法
+  }
+  // ...
+},
+```
+
+---
+
+### 11.3 URL 导入入口的代码实现
+
+**入口位置**：[ImportModal/index.tsx#L11-L47](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/features/modals/ImportModal/index.tsx#L11-L47)
+
+```typescript
+export const ImportModal = ({ opened, onClose }: ModalProps) => {
+  const [url, setURL] = React.useState("");
+  const setContents = useFile(state => state.setContents);
+  const setFormat = useFile(state => state.setFormat);
+
+  const handleImportFile = () => {
+    if (url) {
+      toast.loading("Loading...", { id: "toastFetch" });
+      gaEvent("fetch_url");
+
+      // ⚠️ 关键：直接在组件内调用 fetch，绕过了 store 的 fetchUrl 方法
+      return fetch(url)
+        .then(res => res.json())
+        .then(json => {
+          setContents({ contents: JSON.stringify(json, null, 2) });
+          onClose();
+        })
+        .catch(() => toast.error("Failed to fetch JSON!"))
+        .finally(() => toast.dismiss("toastFetch"));
+    } else if (file) {
+      // 文件导入逻辑...
+    }
+  };
+  // ...
+};
+```
+
+**调用链路**：
+```
+用户点击 FileMenu → Import → 打开 ImportModal
+     │
+     ▼
+用户在 TextInput 中输入 URL → 点击 Import 按钮
+     │
+     ▼
+handleImportFile()  ← 组件内部方法
+     │
+     ▼
+fetch(url)   ← 直接在组件中调用原生 fetch
+     │
+     ▼
+res.json() → JSON.stringify(json, null, 2)
+     │
+     ▼
+setContents({ contents: jsonStr })
+```
+
+---
+
+### 11.4 两条路径的代码实现差异对比
+
+| 对比维度 | 地址参数入口 | URL 导入入口 |
+|----------|-------------|-------------|
+| **触发时机** | 页面加载时自动触发（useEffect） | 用户手动点击 Import 按钮触发 |
+| **代码位置** | store 层：[useFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts) | 组件层：[ImportModal/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/features/modals/ImportModal/index.tsx) |
+| **fetch 调用位置** | store 内部 `fetchUrl()` 方法 | ImportModal 组件内直接调用原生 `fetch()` |
+| **URL 有效性校验** | ✅ `isURL()` 严格正则校验 | ❌ **无校验**，直接将用户输入传给 fetch |
+| **hasChanges 默认值** | `true`（setContents 未显式指定） | `true`（setContents 未显式指定，使用默认值） |
+| **错误提示文本** | `"Failed to fetch document from URL!"` | `"Failed to fetch JSON!"` |
+| **Google Analytics** | ❌ 无埋点 | ✅ `gaEvent("fetch_url")` 埋点 |
+| **Loading 状态** | 依赖 useJson store 的 `loading` 状态 | 使用 `toast.loading("Loading...")` 独立提示 |
+| **错误时行为** | `get().clear()` 清空内容 | 仅显示错误 toast，不清空当前内容 |
+| **Widget 模式支持** | ✅ 支持（通过 widget 参数控制） | ❌ Widget 页面无 ImportModal |
+
+---
+
+### 11.5 对本地缓存与恢复界限的影响：关键发现
+
+两条路径最核心的差异在于 **`isFetchURL` 标志的计算结果不同**，这直接决定了远程加载的内容是否会被写入本地 sessionStorage。
+
+#### `isFetchURL` 判断逻辑
+
+**位置**：[useFile.ts#L109](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts#L109)
+
+```typescript
+const isFetchURL = window.location.href.includes("?");
+```
+
+> **⚠️ 关键漏洞**：`isFetchURL` 的判断依据是**当前浏览器地址栏 URL 是否包含 `?`**，而不是数据的实际来源。
+
+---
+
+#### 路径一：地址参数入口 → `isFetchURL = true`
+
+**场景**：用户访问 `https://jsoncrack.com/editor?json=https://example.com/data.json`
+
+```
+window.location.href = "https://jsoncrack.com/editor?json=https://example.com/data.json"
+                              │
+                              └─ 包含 "?" → isFetchURL = true
+                                               │
+                                               ▼
+setContents() 中缓存条件检查：
+  get().hasChanges → true
+  contents 存在且 < 80KB → true
+  !isIframe() → true
+  !isFetchURL → false  ← ⛔ 条件不满足
+                                           │
+                                           ▼
+                              ❌ sessionStorage.setItem 不会执行
+                              （远程内容不会污染本地缓存）
+```
+
+**结果**：✅ **远程内容被隔离**，不会写入 sessionStorage
+
+---
+
+#### 路径二：URL 导入入口 → `isFetchURL = false`
+
+**场景**：用户直接访问 `https://jsoncrack.com/editor`，然后通过 ImportModal 输入 URL 导入
+
+```
+window.location.href = "https://jsoncrack.com/editor"
+                              │
+                              └─ 不包含 "?" → isFetchURL = false
+                                               │
+                                               ▼
+setContents() 中缓存条件检查：
+  get().hasChanges → true (默认值)
+  contents 存在且 < 80KB → true
+  !isIframe() → true
+  !isFetchURL → true  ← ✅ 所有条件满足
+                                           │
+                                           ▼
+                              ✅ sessionStorage.setItem 被执行
+                              （远程内容被写入本地缓存！）
+```
+
+**结果**：⚠️ **远程内容泄漏到本地缓存**，用户后续刷新页面时会恢复这份远程数据
+
+---
+
+### 11.6 缓存界限穿透的完整演示
+
+| 步骤 | 用户操作 | 浏览器 URL | `isFetchURL` | 数据来源 | sessionStorage 状态 |
+|------|---------|-----------|-------------|---------|-------------------|
+| 1 | 直接访问编辑器 | `/editor` | `false` | 默认示例 | 空（或历史内容） |
+| 2 | 打开 ImportModal，输入 `https://a.com/data.json`，点击 Import | `/editor` | `false` | 远程 fetch | ✅ **被写入**：`data.json` 的内容 |
+| 3 | 刷新页面 | `/editor` | `false` | sessionStorage 恢复 | 恢复 `data.json` 的内容 |
+
+**对比地址参数入口**：
+
+| 步骤 | 用户操作 | 浏览器 URL | `isFetchURL` | 数据来源 | sessionStorage 状态 |
+|------|---------|-----------|-------------|---------|-------------------|
+| 1 | 访问 `/editor?json=https://a.com/data.json` | `/editor?json=...` | `true` | 远程 fetch | ❌ **不写入** |
+| 2 | 刷新页面 | `/editor?json=...` | `true` | 再次远程 fetch | 保持为空或历史内容 |
+
+---
+
+### 11.7 代码设计问题总结
+
+#### 问题 1：`isFetchURL` 判断维度错误
+
+**当前实现**：[useFile.ts#L109](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts#L109)
+```typescript
+const isFetchURL = window.location.href.includes("?");  // 以浏览器地址栏为判断依据
+```
+
+**问题**：判断的是"页面 URL 是否有查询参数"，而不是"当前内容是否来自远程加载"。URL 导入入口虽然也是远程加载，但因页面 URL 无 `?` 导致被误判为"本地编辑"。
+
+**建议修复方向**：在 `setContents` 的参数中增加 `source` 字段（如 `"remote" | "local" | "default"`），或在 store 中维护 `dataSource` 状态，而不是依赖地址栏判断。
+
+```typescript
+// 建议的修复方案
+setContents: async ({ contents, hasChanges = true, source = "local", format }) => {
+  // ...
+  if (source === "local" && ...) {
+    sessionStorage.setItem("content", contents);
+  }
+  // ...
+};
+```
+
+#### 问题 2：URL 导入入口缺少 URL 校验
+
+**当前实现**：[ImportModal/index.tsx#L25-L32](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/features/modals/ImportModal/index.tsx#L25-L32)
+```typescript
+return fetch(url)  // 直接使用用户输入，无任何校验
+  .then(res => res.json())
+```
+
+**问题**：用户可能输入非 URL 字符串、恶意 URL 或不支持的协议，缺少与 `checkEditorSession` 中一致的 `isURL()` 校验。
+
+#### 问题 3：两条路径 fetch 逻辑重复
+
+- 地址参数入口：store 层 `fetchUrl()` 方法
+- URL 导入入口：组件层直接调用 `fetch()`
+
+两处实现了几乎相同的 fetch → parse → stringify → setContents 逻辑，违反 DRY 原则，且导致行为不一致（错误提示、缓存策略等）。
+
+**建议**：URL 导入入口应统一调用 `useFile.getState().fetchUrl(url)`，而非在组件内重新实现。
+
+---
+
 ## 总结
 
 | 问题 | 结论 | 证据 |
 |------|------|------|
 | **一键生成分享链接是否实现？** | ❌ 未实现 | 无相关函数、无 UI 按钮、无剪贴板复制 URL 逻辑 |
-| **远程加载与本地恢复是否有明确界限？** | ✅ 界限清晰 | 三层判断：URL 正则校验、isFetchURL 标志、Widget 模式隔离 |
+| **远程加载与本地恢复是否有明确界限？** | ⚠️ 名义上有，但存在漏洞 | 地址参数入口能正确隔离，但 URL 导入入口会将远程内容写入本地缓存 |
 | **压缩过程是否包含在流程中？** | ❌ 完全不存在 | 无压缩库依赖、无 base64 编码、所有持久化使用原始字符串 |
+| **两条远程加载路径是否一致？** | ❌ 存在显著差异 | 代码位置、URL 校验、缓存策略、错误处理均不同 |
+
+### 核心发现
+
+1. **两条独立远程加载路径**：
+   - **地址参数入口**：页面加载时自动触发，走 store 层 `checkEditorSession()` → `fetchUrl()`，**能正确隔离远程内容**
+   - **URL 导入入口**：用户手动触发 ImportModal，组件内直接调用 `fetch()`，**会将远程内容写入 sessionStorage**
+
+2. **缓存界限穿透漏洞**：
+   - 根本原因是 `isFetchURL` 以 `window.location.href.includes("?")` 作为判断标准
+   - 当用户通过 ImportModal 导入远程 URL 时，页面地址栏无 `?`，导致 `isFetchURL = false`
+   - 远程数据被误写入 sessionStorage，下次刷新时被当作"本地内容"恢复
+
+3. **代码层面的其他差异**：
+   - 地址参数入口有 `isURL()` 严格正则校验，URL 导入入口无校验
+   - 地址参数入口错误时清空内容，URL 导入入口仅显示错误提示
+   - URL 导入入口有 GA 埋点，地址参数入口无埋点
 
 当前 JSON Crack 的 URL 分享机制本质上是 **"远程 URL 引用"** 而非 **"内容编码分享"**，用户无法直接将本地编辑的 JSON 内容通过 URL 分享给他人，只能分享一个指向远程 JSON 数据的 URL。
