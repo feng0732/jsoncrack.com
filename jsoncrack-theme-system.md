@@ -216,14 +216,61 @@ React.useEffect(() => {
 
 | 对比项 | editor.tsx | widget.tsx |
 |--------|-----------|------------|
-| 主题来源 | Zustand store (`darkmodeEnabled`) | `postMessage` 外部传入 + Zustand store 双源 |
+| 主题来源 | Zustand store (`darkmodeEnabled`)，单一来源 | **双状态并存**：本地 `theme` state + Zustand `darkmodeEnabled` |
+| 主题驱动源 | 用户 UI 交互（2 个入口）触发 `toggleDarkMode` | `postMessage` 外部传入（必须携带 json 字段） |
 | 本地 state | 无（直接读 store） | 有 `const [theme, setTheme] = useState<"dark" \| "light">("dark")` |
-| Mantine 同步 | `useEffect` 监听 `darkmodeEnabled` → `setColorScheme()` | `useEffect` 监听 `theme` state → `setColorScheme()` |
-| styled-components 同步 | `ThemeProvider theme={darkmodeEnabled ? darkTheme : lightTheme}` | `ThemeProvider theme={theme === "dark" ? darkTheme : lightTheme}` |
-| 画布主题传递 | `<JSONCrack theme={darkmodeEnabled ? "dark" : "light"}>` | `<GraphView isWidget>` → 内部同样读 `useConfig.darkmodeEnabled` |
-| 持久化 | Zustand persist → `localStorage["config"]` | 同样 Zustand persist（但每次 postMessage 都会覆盖） |
+| Mantine 同步 | `useEffect` 监听 `darkmodeEnabled` → `setColorScheme()` | `useEffect` 监听 **本地 `theme` state** → `setColorScheme()` |
+| styled-components 同步 | `ThemeProvider theme={darkmodeEnabled ? darkTheme : lightTheme}` | `ThemeProvider theme={theme === "dark" ? darkTheme : lightTheme}` → 读取**本地 `theme` state** |
+| 画布主题传递 | `<JSONCrack theme={darkmodeEnabled ? "dark" : "light"}>` | `<GraphView isWidget>` → 内部读 **`useConfig.darkmodeEnabled`**（不读本地 state） |
+| 持久化 | Zustand persist → `localStorage["config"]` | 同样 Zustand persist（每次 postMessage 覆盖） |
 | 画布工具栏（偏好菜单） | 渲染（`{!isWidget && <Toolbar />}`，L91） | **不渲染**（`isWidget=true` 时被 `{!isWidget}` 条件排除） |
 | 主题切换入口数 | 2 个（顶栏 ThemeToggle + 画布偏好菜单） | **0 个 UI 入口**，仅通过 `postMessage` 接收外部指令 |
+
+### 嵌入页双状态职责边界（核心澄清）
+
+嵌入页（`widget.tsx`）中存在**两个独立但同步**的主题状态，各自驱动不同的子系统：
+
+#### 1. 本地 `theme` state（`widget.tsx` L40）
+```typescript
+const [theme, setTheme] = React.useState<"dark" | "light">("dark");
+```
+**职责**：驱动 **Mantine 层** 和 **styled-components 层**
+- **Mantine 消费者**（`widget.tsx` L77-L79）：
+  ```tsx
+  React.useEffect(() => {
+    setColorScheme(theme);  // 读取本地 theme state
+  }, [setColorScheme, theme]);
+  ```
+- **styled-components 消费者**（`widget.tsx` L82）：
+  ```tsx
+  <ThemeProvider theme={theme === "dark" ? darkTheme : lightTheme}>
+  ```
+
+#### 2. Zustand `darkmodeEnabled`（`useConfig` store）
+**职责**：驱动 **画布层** + **持久化**
+- **画布消费者**（`GraphView/index.tsx` L58, L101）：
+  ```tsx
+  const darkmodeEnabled = useConfig(state => state.darkmodeEnabled);  // 读 Zustand
+  // ...
+  <JSONCrack theme={darkmodeEnabled ? "dark" : "light"} />
+  ```
+- **持久化**：zustand/persist 自动写入 `localStorage["config"]`
+
+#### 3. 同步机制（`widget.tsx` L60-L62）
+两个状态在 postMessage handler 中**同步依次更新**，确保始终一致：
+```tsx
+if (event.data?.options?.theme === "light" || event.data?.options?.theme === "dark") {
+  setTheme(event.data.options.theme);              // 1. 更新本地 state → Mantine + styled-components
+  toggleDarkMode(event.data.options.theme === "dark");  // 2. 更新 Zustand → 画布 + 持久化
+}
+```
+
+**为什么需要双状态？**
+- 本地 `theme` state 是 `postMessage` 主题参数的**接收缓冲区**，直接驱动页面 UI 框架（Mantine/styled-components）
+- Zustand `darkmodeEnabled` 是**全局配置源**，负责画布渲染和持久化，与编辑器页共享同一 store
+- 两者同步写入保证三层系统的一致性
+
+---
 
 **嵌入页的同步链路（含 postMessage 前置守卫）**：
 
@@ -324,7 +371,79 @@ Chrome 扩展的特点：
 - 没有用户可操作的主题切换 UI（跟随系统）
 - 不使用 styled-components ThemeProvider 或 Mantine，仅使用 `jsoncrack-react` 包的 CSS Variables 机制
 
-### 2.6 Mantine 专用：智能颜色方案管理器
+---
+
+### 2.6 四端主题状态来源与刷新时序对比
+
+四个客户端的主题驱动机制完全不同，汇总如下：
+
+| 对比维度 | 编辑器页 `/editor` | 嵌入页 `/widget` | VS Code 扩展 | Chrome 扩展 |
+|---------|-------------------|-----------------|-------------|------------|
+| **主题状态来源** | Zustand store `darkmodeEnabled`（单一来源） | 双状态：本地 `theme` state + Zustand `darkmodeEnabled` | `document.body.getAttribute("data-vscode-theme-kind")` | `window.matchMedia("(prefers-color-scheme: dark)")` |
+| **驱动触发源** | 用户 UI 交互（2 个入口：ThemeToggle + 偏好菜单） | 父页面 `postMessage`（必须携带 json） | VS Code 宿主环境（页面加载时一次性读取） | 操作系统（实时监听 `MediaQueryList` 事件） |
+| **本地 state** | 无（直接读 Zustand） | 有 `useState<"dark" \| "light">("dark")` | 无（直接读 DOM 属性） | 有 `useState`（仅作为系统主题的镜像） |
+| **使用 Zustand** | ✅ 唯一真实数据源 | ✅ 双状态并存 | ❌ 无 | ❌ 无 |
+| **使用 Mantine** | ✅ `ColorSchemeManager` | ✅ `ColorSchemeManager` | ✅ `forceColorScheme` | ❌ 无 |
+| **使用 styled-components** | ✅ `ThemeProvider` | ✅ `ThemeProvider` | ❌ 无 | ❌ 无 |
+| **Mantine 同步方式** | `useEffect([darkmodeEnabled]) → setColorScheme()` | `useEffect([本地 theme]) → setColorScheme()` | `forceColorScheme={theme}`（一次性锁定） | N/A |
+| **styled-components 同步方式** | `ThemeProvider theme={darkmodeEnabled ? ...}` | `ThemeProvider theme={本地 theme ? ...}` | N/A | N/A |
+| **画布主题传递** | `<JSONCrack theme={darkmodeEnabled ? ...}>` | `<JSONCrack theme={useConfig.darkmodeEnabled}>` | `<JSONCrack theme={theme}>` | `<JSONCrackComponent theme={theme}>` |
+| **运行时切换能力** | ✅ 用户可随时切换 | ✅ 父页面可随时发 postMessage | ❌ 页面加载时一次性确定，无切换监听 | ✅ 实时跟随系统主题变化 |
+| **持久化** | Zustand persist → `localStorage["config"]` + Mantine → `localStorage["editor-color-scheme"]` | 同上（双持久化） | ❌ 无（每次加载重新读取） | ❌ 无（每次挂载重新检测） |
+
+### 2.6.1 四端状态驱动因果链
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                        编辑器页 (editor.tsx)                                   │
+│  Zustand store.darkmodeEnabled                                                │
+│    ↑ (toggleDarkMode)                                                         │
+│    ├─ 用户点击顶栏 ThemeToggle  → 直接驱动所有三层                             │
+│    └─ 用户点击画布偏好菜单   → 直接驱动所有三层                                │
+└───────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                        嵌入页 (widget.tsx)                                    │
+│  postMessage({json: "...", options: {theme: "light"}})                        │
+│    │ [Guard L59] if (!json) return;                                           │
+│    ▼                                                                          │
+│  ┌─ 同步执行 ──────────────────────────────────────────────────────────────┐  │
+│  │  ① setTheme("light")           → 本地 state                           │  │
+│  │     ├─ 驱动 Mantine (useEffect([theme]) → setColorScheme)            │  │
+│  │     └─ 驱动 styled-components (ThemeProvider theme=...)               │  │
+│  │  ② toggleDarkMode(false)        → Zustand store                       │  │
+│  │     ├─ 驱动 GraphView 画布 (<JSONCrack theme=...>)                    │  │
+│  │     └─ 持久化到 localStorage["config"]                                │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                      VS Code 扩展 (apps/vscode/src/App.tsx)                   │
+│  document.body.getAttribute("data-vscode-theme-kind")                        │
+│    │ 页面加载时一次性读取                                                     │
+│    ▼                                                                          │
+│  <MantineProvider forceColorScheme={theme}>                                   │
+│  <JSONCrack json={...} theme={theme} />                                       │
+│  无 Zustand，无运行时切换监听                                                 │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                    Chrome 扩展 (apps/chrome-extension/...)                    │
+│  window.matchMedia("(prefers-color-scheme: dark)")                            │
+│    │ 挂载时 + "change" 事件时触发                                             │
+│    ▼                                                                          │
+│  useSystemTheme() → 本地 state（仅作为镜像）                                  │
+│    │                                                                          │
+│    ▼                                                                          │
+│  <JSONCrackComponent json={...} theme={theme} />                              │
+│  无 Zustand，无 Mantine，无 styled-components，仅 CSS Variables               │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2.7 Mantine 专用：智能颜色方案管理器
 
 为了实现**路径感知**的主题行为（编辑器页面用动态主题，营销页面强制浅色），项目自定义了 `smartColorSchemeManager`：
 
@@ -703,7 +822,7 @@ const theme = useConfig(state => (state.darkmodeEnabled ? "vs-dark" : "light"));
 └─ 3. 与场景 A 完全一致（同一个 Zustand store，同一个 toggleDarkMode）
 ```
 
-### 场景 C：嵌入页 — 外部 postMessage 传入主题（必须携带 json）
+### 场景 C：嵌入页 — 外部 postMessage 传入主题（必须携带 json，双状态分路驱动）
 
 ```
 时间轴（从上到下）
@@ -711,55 +830,78 @@ const theme = useConfig(state => (state.darkmodeEnabled ? "vs-dark" : "light"));
 ├─ 1. [外部消息] 父页面发送 postMessage({json: "...", options: {theme: "light"}})
 │   ↑ 注：若未携带 json 字段，L59 guard 直接 return，整条消息被丢弃
 │
-├─ 2. [widget.tsx handler] 接收并同步（主题参数在 json 检查之后处理）
-│   ├─ setTheme("light")                          → 组件本地 state
-│   └─ toggleDarkMode(false)                      → Zustand store + localStorage["config"]
+├─ 2. [widget.tsx handler] 同步执行两个状态更新（L60-L62）
+│   │
+│   ├─ 2a. setTheme("light")                       → 本地 state 更新
+│   │   │  （驱动 Mantine + styled-components 层）
+│   │   │
+│   │   └─→ 3. [Mantine 同步] useEffect([theme]) 触发（L77-L79）
+│   │       └─ setColorScheme("light")
+│   │           └─ localStorage["editor-color-scheme"] = "light"
+│   │               └─ Mantine 组件重绘
+│   │
+│   └─ 2b. toggleDarkMode(false)                   → Zustand store 更新
+│        │  （驱动画布层 + 持久化）
+│        ├─ persist 中间件：localStorage["config"] = {...darkmodeEnabled: false}
+│        │
+│        └─→ 4. [styled-components 同步] WidgetPage 重渲染
+│        │   └─ <ThemeProvider theme={lightTheme}>  → styled.* 组件重算样式
+│        │
+│        └─→ 5. [画布同步] GraphView 内部 selector 触发重渲染（L58）
+│            └─ <JSONCrack theme="light" />  props 更新（L101）
+│                └─ buildCanvasStyle("light") → CSS Variables 更新
+│                    └─ 浏览器层叠重绘（无需 React 遍历节点）
 │
-├─ 3. [Mantine 同步] useEffect([theme]) 触发
-│   └─ setColorScheme("light")
-│       └─ localStorage["editor-color-scheme"] = "light"
-│
-├─ 4. [styled-components 同步] ThemeProvider 读取 theme state
-│   └─ <ThemeProvider theme={lightTheme}>
-│
-├─ 5. [画布同步] GraphView 内部读 useConfig.darkmodeEnabled
-│   └─ <JSONCrack theme="light" />
-│       └─ buildCanvasStyle("light") → CSS Variables 更新
-│
-└─ 6. [渲染完成]
+└─ 6. [渲染完成] 三层系统全部更新完毕
 ```
 
-### 场景 D：Chrome 扩展 — 跟随系统主题
+**双状态分路说明**：
+- 本地 `theme` state → 驱动 Mantine（L77-79）和 styled-components（L82）
+- Zustand `darkmodeEnabled` → 驱动 GraphView 画布（GraphView L58, L101）和持久化
+- 两者在 handler 中**同步依次执行**，保证三层系统一致
 
-```
-时间轴（从上到下）
-│
-├─ 1. [系统事件] 操作系统切换明暗模式
-│
-├─ 2. [useSystemTheme] MediaQueryList "change" 事件触发
-│   └─ setTheme(event.matches ? "dark" : "light")
-│
-├─ 3. [画布同步] GraphView 重渲染
-│   └─ <JSONCrackComponent theme={theme} />
-│       └─ buildCanvasStyle() → CSS Variables 更新
-│
-└─ 4. [渲染完成]
-    注意：Chrome 扩展不使用 Mantine/styled-components，仅依赖 CSS Variables
-```
-
-### 场景 E：VS Code 扩展 — 跟随 IDE 主题
+### 场景 D：Chrome 扩展 — 跟随系统主题（仅 CSS Variables，无 UI 框架）
 
 ```
 时间轴（从上到下）
 │
-├─ 1. [页面加载] getTheme() 读取 data-vscode-theme-kind 属性
+├─ 1. [系统事件] 操作系统切换明暗模式（如 macOS → 系统设置 → 外观 → 浅色）
 │
-├─ 2. [Mantine 锁定] <MantineProvider forceColorScheme={theme}>
+├─ 2. [useSystemTheme] MediaQueryList "change" 事件触发（content-script.tsx L93-L99）
+│   └─ setTheme(event.matches ? "dark" : "light")  → 更新本地 state
 │
-├─ 3. [画布同步] <JSONCrack theme={theme} />
+├─ 3. [GraphView 重渲染]（content-script.tsx L305, L351-L358）
+│   └─ <JSONCrackComponent theme={theme} />  props 更新
+│       └─ buildCanvasStyle(theme, style) 重新执行（JSONCrackComponent.tsx L161）
+│           └─ 生成 20+ 个 CSS Variables 的新 style 对象
+│               └─ div[style=...] 更新 inline style
+│                   └─ 浏览器根据 CSS 变量层叠重绘
 │
 └─ 4. [渲染完成]
-    注意：VS Code 扩展主题在页面加载时一次性确定，无运行时切换
+    注意：Chrome 扩展**不使用** Zustand、Mantine、styled-components
+          仅依赖 `jsoncrack-react` 包的 CSS Variables 机制
+```
+
+### 场景 E：VS Code 扩展 — 跟随 IDE 主题（一次性读取，无运行时切换）
+
+```
+时间轴（从上到下）
+│
+├─ 1. [页面加载] VS Code 注入主题属性到 document.body
+│   └─ getTheme() 读取 data-vscode-theme-kind 属性（App.tsx L15-L19）
+│       → "vscode-light" 或 "vscode-dark" 或 "vscode-high-contrast" 等
+│
+├─ 2. [Mantine 锁定] <MantineProvider forceColorScheme={theme}>（App.tsx L53）
+│   └─ Mantine 主题在组件挂载时一次性锁定，无运行时监听
+│
+├─ 3. [画布同步] <JSONCrack json={json} theme={theme} />（App.tsx L56）
+│   └─ buildCanvasStyle(theme, style)  → CSS Variables 初始化
+│       └─ 画布首次渲染时应用主题
+│
+└─ 4. [渲染完成]
+    注意：VS Code 扩展**不使用** Zustand 和 styled-components
+          主题在页面加载时一次性确定，**不监听** IDE 主题变化
+          用户需刷新 Webview 才能应用新主题
 ```
 
 ---
@@ -867,86 +1009,103 @@ const canvasStyle = useMemo(
 
 ---
 
-## 八、双持久化机制说明
+## 八、双持久化机制说明（仅限 `apps/www`）
 
-项目存在两个独立的主题持久化存储（仅限 `apps/www`）：
+项目的主题持久化机制**仅存在于 `apps/www`** 下的编辑器页和嵌入页。VS Code 扩展和 Chrome 扩展均不使用任何持久化，主题在每次加载时重新检测。
 
-| localStorage Key | 写入者 | 用途 | 格式 |
-|------------------|--------|------|------|
-| `config` | zustand/persist（useConfig） | 应用配置（含 darkmodeEnabled、rulersEnabled 等） | `{"darkmodeEnabled":true,...}` JSON 字符串 |
-| `editor-color-scheme` | smartColorSchemeManager | Mantine 颜色方案 | `"dark"` 或 `"light"` 字符串 |
+### 8.1 `apps/www` 的双持久化存储
 
-**为什么需要两个？**
-1. `config` 是 zustand store 的整体持久化，包含所有配置项
-2. `editor-color-scheme` 是 Mantine ColorSchemeManager 协议要求的独立存储
-3. 在 `editor.tsx` 中通过 `useEffect` 将两者**同步**：
-   ```tsx
-   useEffect(() => {
-     setColorScheme(darkmodeEnabled ? "dark" : "light");
-   }, [darkmodeEnabled, setColorScheme]);
-   ```
-   即：**zustand store 是主数据源，Mantine 的 localStorage 是其派生镜像**。
+| localStorage Key | 写入者 | 适用页面 | 用途 | 格式 |
+|------------------|--------|---------|------|------|
+| `config` | zustand/persist（useConfig） | `/editor`, `/widget` | 应用配置（含 darkmodeEnabled、rulersEnabled 等） | `{"darkmodeEnabled":true,...}` JSON 字符串 |
+| `editor-color-scheme` | smartColorSchemeManager | `/editor`, `/widget` | Mantine 颜色方案 | `"dark"` 或 `"light"` 字符串 |
 
-**嵌入页的额外同步**：`widget.tsx` 中同时维护一个本地 `theme` state，它通过 `postMessage` 写入、`toggleDarkMode` 同步回 Zustand store，并通过 `useEffect([theme])` 同步到 Mantine。
+### 8.2 各端持久化对比
+
+| 客户端 | 是否使用 `localStorage["config"]` | 是否使用 `localStorage["editor-color-scheme"]` | 说明 |
+|--------|----------------------------------|----------------------------------------------|------|
+| 编辑器页 | ✅ | ✅ | Zustand persist 自动写入；Mantine 通过 setColorScheme 写入 |
+| 嵌入页 | ✅ | ✅ | 双状态同步写入：toggleDarkMode 写 Zustand；setColorScheme 写 Mantine |
+| VS Code 扩展 | ❌ | ❌ | 无 Zustand，每次加载重新读取 `data-vscode-theme-kind` |
+| Chrome 扩展 | ❌ | ❌ | 无 Zustand 无 Mantine，每次挂载重新检测 `prefers-color-scheme` |
+
+### 8.3 同步机制
+
+**编辑器页**：`editor.tsx` 通过 `useEffect` 将 Zustand store 同步到 Mantine：
+```tsx
+useEffect(() => {
+  setColorScheme(darkmodeEnabled ? "dark" : "light");
+}, [darkmodeEnabled, setColorScheme]);
+```
+即：**zustand store 是主数据源，Mantine 的 localStorage 是其派生镜像**。
+
+**嵌入页**：`widget.tsx` 中同时维护一个本地 `theme` state，它通过 `postMessage` 写入：
+```tsx
+// 同步依次执行
+setTheme(event.data.options.theme);              // → Mantine + styled-components
+toggleDarkMode(event.data.options.theme === "dark");  // → Zustand + 画布 + 持久化
+```
+本地 `theme` state 通过 `useEffect([theme])` 同步到 Mantine；Zustand `darkmodeEnabled` 自动持久化。两者同步写入保证一致性。
 
 ---
 
-## 九、四入口统一架构图
+## 九、四入口统一架构图（四端差异标注）
 
 ```
-              ┌─────────────────────────────────────────────────────────────────┐
-              │                    主题切换入口                                   │
-              ├──────────────┬───────────────────┬──────────────┬───────────────┤
-              │  入口 A       │  入口 B            │  入口 C       │  入口 D       │
-              │  顶栏Toggle  │  画布偏好菜单       │  postMessage │  外部客户端   │
-              │  ThemeToggle │  Preferences Menu  │  (嵌入页)     │  VS Code/    │
-              │              │                    │              │  Chrome      │
-              └──────┬───────┴────────┬──────────┴──────┬───────┴───────┬───────┘
-                     │                │                  │               │
-                     │                │                  │               │
-                     ▼                ▼                  ▼               ▼
-              ┌────────────┐  ┌────────────┐  ┌────────────────┐  ┌──────────────┐
-              │ useConfig  │  │ useConfig  │  │ widget.tsx     │  │ 环境原生主题  │
-              │ .toggle    │  │ .toggle    │  │ setTheme()     │  │              │
-              │ DarkMode() │  │ DarkMode() │  │ + toggleDark   │  │ VS Code:     │
-              │            │  │            │  │   Mode()       │  │ data-vscode- │
-              └─────┬──────┘  └─────┬──────┘  │                │  │ theme-kind   │
-                    │               │          │ Zustand store  │  │ Chrome:      │
-                    │               │          │ 同步更新        │  │ prefers-     │
-                    └───────┬───────┘          └───────┬────────┘  │ color-scheme │
-                            │                          │           └──────┬───────┘
-                            ▼                          │                  │
-                   ┌────────────────┐                  │                  │
-                   │ Zustand Store  │◄─────────────────┘                  │
-                   │ darkmodeEnabled│                                     │
-                   │ + persist →    │                                     │
-                   │ localStorage   │                                     │
-                   │ ["config"]     │                                     │
-                   └───┬────┬───┬───┘                                     │
-                       │    │   │                                         │
-          ┌────────────┘    │   └──────────────┐                          │
-          ▼                 ▼                  ▼                          ▼
- ┌─────────────────┐ ┌──────────────┐ ┌───────────────┐      ┌───────────────────┐
- │ ThemeProvider   │ │ GraphView    │ │ TextEditor    │      │ <JSONCrack        │
- │ (styled-comp)   │ │ <JSONCrack   │ │ Monaco theme  │      │   theme={env}     │
- │ darkTheme/      │ │  theme=      │ │ "vs-dark"/    │      │ />                │
- │ lightTheme      │ │  dark/light  │ │ "light"       │      │ (无 Zustand,      │
- └────────┬────────┘ └──────┬───────┘ └───────────────┘      │  直接环境主题)     │
-          │                 │                                 └────────┬──────────┘
-          ▼                 ▼                                          │
- ┌─────────────────┐ ┌───────────────┐                                │
- │ styled.* 组件   │ │ CSS Variables │◄───────────────────────────────┘
- │ 重计算样式      │ │ 20+ 变量更新  │
- └────────┬────────┘ └───────┬───────┘
-          │                  │
-          ▼                  ▼
-   ┌─────────────────────────────────┐
-   │      useEffect → Mantine        │
-   │      setColorScheme()           │
-   │      → localStorage            │
-   │        ["editor-color-scheme"]  │
-   │      → MantineProvider 更新     │
-   └─────────────────────────────────┘
+              ┌────────────────────────────────────────────────────────────────────────┐
+              │                    主题切换入口（按客户端可用性）                         │
+              ├──────────────┬───────────────────┬──────────────┬───────────────────┤
+              │  入口 A       │  入口 B            │  入口 C       │  入口 D           │
+              │  顶栏Toggle  │  画布偏好菜单       │  postMessage │  外部客户端       │
+              │  ThemeToggle │  Preferences Menu  │  (嵌入页)     │  VS Code / Chrome │
+              │ 仅/editor    │ 仅/editor         │ 仅/widget    │  独立客户端        │
+              └──────┬───────┴────────┬──────────┴──────┬───────┴──────────┬────────┘
+                     │                │                  │                   │
+                     ▼                ▼                  │                   │
+              ┌────────────┐  ┌────────────┐            │                   │
+              │ useConfig  │  │ useConfig  │            │                   │
+              │ .toggle    │  │ .toggle    │            │                   │
+              │ DarkMode() │  │ DarkMode() │            │                   │
+              └─────┬──────┘  └─────┬──────┘            │                   │
+                    │               │                   │                   │
+                    └───────┬───────┘                   │                   │
+                            │                           │                   │
+                            ▼                           ▼                   ▼
+                   ┌────────────────┐          ┌────────────────┐  ┌─────────────────────┐
+                   │ Zustand Store  │          │ widget.tsx      │  │ 环境原生主题          │
+                   │ darkmodeEnabled│          │ 双状态同步写入   │  │                     │
+                   │ + persist →    │          │ ① setTheme()    │  │ VS Code:            │
+                   │ localStorage   │          │   → Mantine +    │  │ data-vscode-theme-   │
+                   │ ["config"]     │          │   styled-comp    │  │ kind                │
+                   └───┬────┬───┬───┘          │ ② toggleDarkMode│  │ Chrome:             │
+                       │    │   │              │   → Zustand +    │  │ prefers-color-      │
+                       │    │   │              │   画布 + 持久化  │  │ scheme              │
+          ┌────────────┘    │   └───────┐      └──────┬──────────┘  └──────────┬──────────┘
+          │                 │           │             │                        │
+          ▼                 ▼           ▼             ▼                        ▼
+ ┌─────────────────┐ ┌──────────────┐ ┌───────────────┐ ┌─────────────────┐ ┌───────────────────┐
+ │ ThemeProvider   │ │ GraphView    │ │ TextEditor    │ │ Mantine +        │ │ <JSONCrack        │
+ │ (styled-comp)   │ │ <JSONCrack   │ │ Monaco theme  │ │ styled-comp      │ │   theme={env}     │
+ │ darkTheme/      │ │  theme=      │ │ "vs-dark"/    │ │ (从本地 theme    │ │ />                │
+ │ lightTheme      │ │  dark/light  │ │ "light"       │ │  state 读取)     │ │ (无 Zustand,      │
+ └────────┬────────┘ └──────┬───────┘ └───────────────┘ └────────┬────────┘ │  直接环境主题)     │
+          │                 │                                      │          └────────┬──────────┘
+          ▼                 ▼                                      ▼                   │
+ ┌─────────────────┐ ┌───────────────┐                     ┌───────────────┐           │
+ │ styled.* 组件   │ │ CSS Variables │                     │ Mantine 组件   │           │
+ │ 重计算样式      │ │ 20+ 变量更新  │                     │ 应用新主题     │           │
+ └─────────────────┘ └───────┬───────┘                     └───────────────┘           │
+                             │                                                         │
+                             └─────────────────────────────────────────────────────────┘
+                                       浏览器 CSS 层叠自动生效
+
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│  四端差异说明：                                                                         │
+│  • 编辑器页：经过 Zustand，入口 A+B 可用，完整三层联动 + 双持久化                         │
+│  • 嵌入页：入口 C 可用，双状态分路驱动（本地 state → UI 框架；Zustand → 画布+持久化）   │
+│  • VS Code 扩展：不经过 Zustand，仅入口 D（环境主题），一次性读取无运行时切换           │
+│  • Chrome 扩展：不经过 Zustand/Mantine/styled-comp，仅入口 D + CSS Variables，实时跟随  │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -1011,3 +1170,34 @@ iframe.contentWindow.postMessage({
   options: { theme: "light", direction: "RIGHT" }
 }, "*");
 ```
+
+### 10.1 主题参数的内部处理链路（嵌入页）
+
+当父页面发送合法的 postMessage（携带 json + theme）时，widget 内部的处理链路如下：
+
+```
+postMessage({json, options: {theme}})
+   │
+   ├─ [Guard L59] if (!json) return;  ✅ 通过
+   │
+   ├─ [L60] theme === "light" || "dark"  ✅ 通过
+   │   │
+   │   ├─→ [L61] setTheme(theme)         → 本地 state 更新
+   │   │    │
+   │   │    ├─→ [L77-79] useEffect([theme])
+   │   │    │   └─ setColorScheme(theme) → Mantine 层更新
+   │   │    │
+   │   │    └─→ [L82] WidgetPage 重渲染
+   │   │         └─ <ThemeProvider theme={...}> → styled-components 层更新
+   │   │
+   │   └─→ [L62] toggleDarkMode(theme === "dark")  → Zustand store 更新
+   │        │
+   │        ├─→ persist 中间件 → localStorage["config"] 持久化
+   │        │
+   │        └─→ GraphView 内部 selector（L58）触发重渲染
+   │             └─→ <JSONCrack theme={...} />  → 画布层 CSS Variables 更新
+   │
+   └─→ [L65-66] JSON 数据 + 布局方向同步
+```
+
+**关键结论**：嵌入页的主题参数通过「双状态分路驱动」保证三层系统一致性，而非由单一状态驱动所有层级。
