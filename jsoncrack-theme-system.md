@@ -59,7 +59,9 @@ JSON Crack 采用了**三层主题系统**协同工作的架构，同时通过**
 
 ## 二、主题状态管理
 
-### 2.1 单一真实数据源：Zustand Store
+### 2.1 单一真实数据源：Zustand Store（仅编辑器页）
+
+> **重要澄清**：Zustand store 作为"单一真实数据源"的模式**仅适用于 `/editor` 编辑器页**。`/widget` 嵌入页采用"双状态并存"的驱动方式（详见 2.4 节和 2.6 节）。
 
 主题状态的核心是 `darkmodeEnabled` 布尔值，存储在 Zustand 的 `useConfig` store 中：
 
@@ -228,40 +230,47 @@ React.useEffect(() => {
 
 ### 嵌入页双状态职责边界（核心澄清）
 
-嵌入页（`widget.tsx`）中存在**两个独立但同步**的主题状态，各自驱动不同的子系统：
+嵌入页（`widget.tsx`）中存在**两个独立但同步**的主题状态，各自驱动不同的子系统，**刷新触发方式不同**：
 
 #### 1. 本地 `theme` state（`widget.tsx` L40）
 ```typescript
 const [theme, setTheme] = React.useState<"dark" | "light">("dark");
 ```
+
 **职责**：驱动 **Mantine 层** 和 **styled-components 层**
 - **Mantine 消费者**（`widget.tsx` L77-L79）：
   ```tsx
   React.useEffect(() => {
-    setColorScheme(theme);  // 读取本地 theme state
+    setColorScheme(theme);  // 由 useEffect([theme]) 主动调用 setColorScheme
   }, [setColorScheme, theme]);
   ```
+  → **触发方式**：`useEffect([theme])` 监听到 theme 变化后，主动调用 Mantine 的 `setColorScheme()` 方法
+
 - **styled-components 消费者**（`widget.tsx` L82）：
   ```tsx
   <ThemeProvider theme={theme === "dark" ? darkTheme : lightTheme}>
   ```
+  → **触发方式**：`setTheme()` 更新 state 后，组件**重渲染**时 `ThemeProvider` 的 `theme` prop 随之变化，styled-components 自动响应
+
+> **关键区分**：Mantine 通过 `useEffect` 主动同步；styled-components 通过组件重渲染 + prop 变化被动响应。两者都依赖 `theme` state，但触发机制不同。
 
 #### 2. Zustand `darkmodeEnabled`（`useConfig` store）
 **职责**：驱动 **画布层** + **持久化**
 - **画布消费者**（`GraphView/index.tsx` L58, L101）：
   ```tsx
-  const darkmodeEnabled = useConfig(state => state.darkmodeEnabled);  // 读 Zustand
+  const darkmodeEnabled = useConfig(state => state.darkmodeEnabled);  // 通过 selector 订阅
   // ...
   <JSONCrack theme={darkmodeEnabled ? "dark" : "light"} />
   ```
-- **持久化**：zustand/persist 自动写入 `localStorage["config"]`
+  → **触发方式**：`toggleDarkMode()` 更新 Zustand store 后，`useConfig` selector 触发 GraphView 组件重渲染，`<JSONCrack>` 的 `theme` prop 变化
+- **持久化**：zustand/persist 中间件自动写入 `localStorage["config"]`
 
 #### 3. 同步机制（`widget.tsx` L60-L62）
-两个状态在 postMessage handler 中**同步依次更新**，确保始终一致：
+两个状态在 postMessage handler 中**同步依次更新**，确保最终三层系统一致：
 ```tsx
 if (event.data?.options?.theme === "light" || event.data?.options?.theme === "dark") {
-  setTheme(event.data.options.theme);              // 1. 更新本地 state → Mantine + styled-components
-  toggleDarkMode(event.data.options.theme === "dark");  // 2. 更新 Zustand → 画布 + 持久化
+  setTheme(event.data.options.theme);              // 1. 更新本地 state → 触发 Mantine(useEffect) + styled-comp(重渲染)
+  toggleDarkMode(event.data.options.theme === "dark");  // 2. 更新 Zustand → 触发画布(selector) + 持久化
 }
 ```
 
@@ -269,6 +278,7 @@ if (event.data?.options?.theme === "light" || event.data?.options?.theme === "da
 - 本地 `theme` state 是 `postMessage` 主题参数的**接收缓冲区**，直接驱动页面 UI 框架（Mantine/styled-components）
 - Zustand `darkmodeEnabled` 是**全局配置源**，负责画布渲染和持久化，与编辑器页共享同一 store
 - 两者同步写入保证三层系统的一致性
+- 但两者**独立触发刷新**，刷新时序可能有细微差异（Mantine/styled-comp 由 React 渲染周期驱动，画布由 Zustand 订阅驱动）
 
 ---
 
@@ -396,48 +406,63 @@ Chrome 扩展的特点：
 ```
 ┌───────────────────────────────────────────────────────────────────────────────┐
 │                        编辑器页 (editor.tsx)                                   │
-│  Zustand store.darkmodeEnabled                                                │
+│                                                                               │
+│  单一真实数据源：Zustand store.darkmodeEnabled                                │
 │    ↑ (toggleDarkMode)                                                         │
-│    ├─ 用户点击顶栏 ThemeToggle  → 直接驱动所有三层                             │
-│    └─ 用户点击画布偏好菜单   → 直接驱动所有三层                                │
+│    ├─ 用户点击顶栏 ThemeToggle                                                │
+│    └─ 用户点击画布偏好菜单                                                     │
+│                                                                               │
+│  Zustand 更新 → 组件 selector 触发 → 重渲染                                   │
+│    ├─ EditorPage 重渲染 → ThemeProvider theme=... 变化 → styled-comp 更新    │
+│    ├─ EditorPage useEffect([darkmodeEnabled]) → setColorScheme() → Mantine  │
+│    └─ GraphView selector 触发 → <JSONCrack theme=...> → CSS Variables        │
 └───────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
+                                      │
+                                      ▼
 ┌───────────────────────────────────────────────────────────────────────────────┐
 │                        嵌入页 (widget.tsx)                                    │
-│  postMessage({json: "...", options: {theme: "light"}})                        │
-│    │ [Guard L59] if (!json) return;                                           │
-│    ▼                                                                          │
-│  ┌─ 同步执行 ──────────────────────────────────────────────────────────────┐  │
-│  │  ① setTheme("light")           → 本地 state                           │  │
-│  │     ├─ 驱动 Mantine (useEffect([theme]) → setColorScheme)            │  │
-│  │     └─ 驱动 styled-components (ThemeProvider theme=...)               │  │
-│  │  ② toggleDarkMode(false)        → Zustand store                       │  │
-│  │     ├─ 驱动 GraphView 画布 (<JSONCrack theme=...>)                    │  │
-│  │     └─ 持久化到 localStorage["config"]                                │  │
-│  └────────────────────────────────────────────────────────────────────────┘  │
+│                                                                               │
+│  双状态并存，各自驱动不同层级                                                  │
+│                                                                               │
+│  ① 本地 theme state    → 驱动 Mantine + styled-comp 层                        │
+│     setTheme("light")                                                        │
+│     ├─ 组件重渲染 → ThemeProvider theme=... 变化 → styled-comp 更新（被动）   │
+│     └─ useEffect([theme]) → setColorScheme() → Mantine 更新（主动）          │
+│                                                                               │
+│  ② Zustand darkmodeEnabled → 驱动画布层 + 持久化                              │
+│     toggleDarkMode(false)                                                    │
+│     ├─ GraphView selector 触发 → <JSONCrack theme=...> → CSS Variables       │
+│     └─ persist 中间件 → localStorage["config"]                                │
+│                                                                               │
+│  两者在 handler 中同步依次执行，保证一致性                                     │
+│  注意：Mantine 和 styled-comp 从本地 state 读；画布从 Zustand 读              │
 └───────────────────────────────────────────────────────────────────────────────┘
 
 ┌───────────────────────────────────────────────────────────────────────────────┐
 │                      VS Code 扩展 (apps/vscode/src/App.tsx)                   │
-│  document.body.getAttribute("data-vscode-theme-kind")                        │
-│    │ 页面加载时一次性读取                                                     │
+│                                                                               │
+│  主题来源：document.body.getAttribute("data-vscode-theme-kind")               │
+│    │ 页面加载时一次性读取（无运行时监听）                                     │
 │    ▼                                                                          │
-│  <MantineProvider forceColorScheme={theme}>                                   │
-│  <JSONCrack json={...} theme={theme} />                                       │
-│  无 Zustand，无运行时切换监听                                                 │
+│  ① <MantineProvider forceColorScheme={theme}> → Mantine 层                   │
+│  ② <JSONCrack json={...} theme={theme} /> → CSS Variables 画布层             │
+│                                                                               │
+│  无 Zustand，无 styled-components                                             │
 └───────────────────────────────────────────────────────────────────────────────┘
 
 ┌───────────────────────────────────────────────────────────────────────────────┐
 │                    Chrome 扩展 (apps/chrome-extension/...)                    │
-│  window.matchMedia("(prefers-color-scheme: dark)")                            │
-│    │ 挂载时 + "change" 事件时触发                                             │
+│                                                                               │
+│  主题来源：window.matchMedia("(prefers-color-scheme: dark)")                  │
+│    │ 挂载时初始化 + "change" 事件实时监听                                     │
 │    ▼                                                                          │
-│  useSystemTheme() → 本地 state（仅作为镜像）                                  │
+│  useSystemTheme() → 本地 state（系统主题的镜像）                              │
 │    │                                                                          │
 │    ▼                                                                          │
-│  <JSONCrackComponent json={...} theme={theme} />                              │
-│  无 Zustand，无 Mantine，无 styled-components，仅 CSS Variables               │
+│  <JSONCrackComponent json={...} theme={theme} /> → CSS Variables              │
+│                                                                               │
+│  无 Zustand，无 Mantine，无 styled-components                                 │
+│  仅使用 jsoncrack-react 包的 CSS Variables 机制                               │
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -766,7 +791,7 @@ const theme = useConfig(state => (state.darkmodeEnabled ? "vs-dark" : "light"));
 
 ## 五、完整响应链路时序分析
 
-### 场景 A：编辑器页面 — 点击顶栏 ThemeToggle
+### 场景 A：编辑器页面 — 点击顶栏 ThemeToggle（Zustand 单一来源）
 
 ```
 时间轴（从上到下）
@@ -774,14 +799,15 @@ const theme = useConfig(state => (state.darkmodeEnabled ? "vs-dark" : "light"));
 ├─ 1. [用户交互] 点击 <ThemeToggle> 中的月亮/太阳图标
 │
 ├─ 2. [状态更新] useConfig.toggleDarkMode(!darkmodeEnabled)
-│   ├─ Zustand 更新内部 state.darkmodeEnabled
+│   ├─ Zustand 更新内部 state.darkmodeEnabled  ← 唯一状态源
 │   └─ persist 中间件：localStorage["config"] = {...darkmodeEnabled: true/false}
 │
 ├─ 3. [订阅通知] 所有使用 selector 读取 darkmodeEnabled 的组件触发重渲染：
 │   │
 │   ├─ 3a. [EditorPage 重渲染]
-│   │   ├─ a1. <ThemeProvider theme={darkTheme/lightTheme}> 切换 theme 对象
-│   │   │   └─ styled-components 通知所有后代 styled.* 组件重新计算样式
+│   │   ├─ a1. [渲染阶段] ThemeProvider theme prop 变化 → styled-components 更新
+│   │   │   （被动响应：组件重渲染时 prop 随之变化）
+│   │   │   └─ styled.* 组件重新计算样式
 │   │   │       ├─ StyledEditor.background → BACKGROUND_SECONDARY
 │   │   │       ├─ StyledToolElement.color → INTERACTIVE_NORMAL
 │   │   │       ├─ StyledBottomBar.border-bottom → BACKGROUND_MODIFIER_ACCENT
@@ -789,13 +815,14 @@ const theme = useConfig(state => (state.darkmodeEnabled ? "vs-dark" : "light"));
 │   │   │       ├─ glassSurface (画布 Toolbar) → 条件判断 BACKGROUND_SECONDARY
 │   │   │       └─ ... 所有使用 ${({theme}) => ...} 的样式
 │   │   │
-│   │   └─ a2. useEffect 依赖 darkmodeEnabled 触发
-│   │       └─ setColorScheme(dark ? "dark" : "light") → Mantine ColorSchemeManager
+│   │   └─ a2. [渲染后副作用] useEffect([darkmodeEnabled]) 触发
+│   │       └─ setColorScheme(dark ? "dark" : "light") → Mantine 更新
+│   │           （主动调用：useEffect 中主动调用 setColorScheme API）
 │   │           ├─ smartColorSchemeManager.set()
 │   │           │   ├─ 更新内存中的 currentColorScheme
 │   │           │   └─ localStorage["editor-color-scheme"] = "dark"/"light"
 │   │           └─ MantineProvider 更新内部 colorScheme
-│   │               └─ 所有 Mantine 组件（Button/Modal/Tooltip/Menu/ActionIcon...）应用新主题
+│   │               └─ 所有 Mantine 组件应用新主题
 │   │
 │   ├─ 3b. [GraphView 重渲染]
 │   │   └─ <JSONCrack theme={darkmodeEnabled ? "dark" : "light"} /> props 更新
@@ -809,6 +836,11 @@ const theme = useConfig(state => (state.darkmodeEnabled ? "vs-dark" : "light"));
 │
 └─ 4. [渲染完成]
 ```
+
+**关键说明**：编辑器页三层系统全部由 Zustand `darkmodeEnabled` 单一状态驱动。其中：
+- styled-components 更新发生在**渲染阶段**（组件重渲染时 prop 变化，被动响应）
+- Mantine 更新发生在**渲染后 useEffect 中**（主动调用 setColorScheme API）
+- 画布更新通过 Zustand selector 订阅触发
 
 ### 场景 B：编辑器页面 — 点击画布偏好菜单的主题项
 
@@ -835,17 +867,18 @@ const theme = useConfig(state => (state.darkmodeEnabled ? "vs-dark" : "light"));
 │   ├─ 2a. setTheme("light")                       → 本地 state 更新
 │   │   │  （驱动 Mantine + styled-components 层）
 │   │   │
-│   │   └─→ 3. [Mantine 同步] useEffect([theme]) 触发（L77-L79）
-│   │       └─ setColorScheme("light")
-│   │           └─ localStorage["editor-color-scheme"] = "light"
-│   │               └─ Mantine 组件重绘
+│   │   ├─→ 3. [styled-comp 同步] WidgetPage 重渲染（React 渲染周期）
+│   │   │      └─ <ThemeProvider theme={lightTheme}>  → styled.* 组件重算样式
+│   │   │          （被动响应：setTheme 导致 state 变化 → 重渲染 → prop 变化）
+│   │   │
+│   │   └─→ 4. [Mantine 同步] useEffect([theme]) 触发（L77-L79，主动调用）
+│   │          └─ setColorScheme("light")
+│   │              └─ localStorage["editor-color-scheme"] = "light"
+│   │                  └─ Mantine 组件重绘
 │   │
 │   └─ 2b. toggleDarkMode(false)                   → Zustand store 更新
 │        │  （驱动画布层 + 持久化）
 │        ├─ persist 中间件：localStorage["config"] = {...darkmodeEnabled: false}
-│        │
-│        └─→ 4. [styled-components 同步] WidgetPage 重渲染
-│        │   └─ <ThemeProvider theme={lightTheme}>  → styled.* 组件重算样式
 │        │
 │        └─→ 5. [画布同步] GraphView 内部 selector 触发重渲染（L58）
 │            └─ <JSONCrack theme="light" />  props 更新（L101）
@@ -855,10 +888,11 @@ const theme = useConfig(state => (state.darkmodeEnabled ? "vs-dark" : "light"));
 └─ 6. [渲染完成] 三层系统全部更新完毕
 ```
 
-**双状态分路说明**：
-- 本地 `theme` state → 驱动 Mantine（L77-79）和 styled-components（L82）
-- Zustand `darkmodeEnabled` → 驱动 GraphView 画布（GraphView L58, L101）和持久化
-- 两者在 handler 中**同步依次执行**，保证三层系统一致
+**双状态分路因果说明**：
+- **2a 分支（本地 state）**：`setTheme()` 更新 state → 组件重渲染 → `ThemeProvider` prop 变化 → styled-components 更新（被动）
+- **2a 分支（useEffect）**：`useEffect([theme])` 监听到变化 → 主动调用 `setColorScheme()` → Mantine 更新（主动）
+- **2b 分支（Zustand）**：`toggleDarkMode()` 更新 store → `useConfig` selector 触发 → GraphView 重渲染 → 画布更新
+- 三条路径**独立触发**，刷新时序可能有细微差异（2a 由 React 渲染调度，2b 由 Zustand 订阅调度）
 
 ### 场景 D：Chrome 扩展 — 跟随系统主题（仅 CSS Variables，无 UI 框架）
 
@@ -1184,20 +1218,24 @@ postMessage({json, options: {theme}})
    │   │
    │   ├─→ [L61] setTheme(theme)         → 本地 state 更新
    │   │    │
-   │   │    ├─→ [L77-79] useEffect([theme])
-   │   │    │   └─ setColorScheme(theme) → Mantine 层更新
+   │   │    ├─ [渲染阶段] WidgetPage 重渲染（L82）
+   │   │    │   └─ <ThemeProvider theme={...}> prop 变化
+   │   │    │       └─ styled-components 层更新（被动响应，同步发生）
    │   │    │
-   │   │    └─→ [L82] WidgetPage 重渲染
-   │   │         └─ <ThemeProvider theme={...}> → styled-components 层更新
+   │   │    └─ [渲染后副作用] useEffect([theme]) 触发（L77-79）
+   │   │        └─ setColorScheme(theme) → Mantine 层更新（主动调用，异步发生）
    │   │
    │   └─→ [L62] toggleDarkMode(theme === "dark")  → Zustand store 更新
    │        │
-   │        ├─→ persist 中间件 → localStorage["config"] 持久化
+   │        ├─ persist 中间件 → localStorage["config"] 持久化
    │        │
-   │        └─→ GraphView 内部 selector（L58）触发重渲染
-   │             └─→ <JSONCrack theme={...} />  → 画布层 CSS Variables 更新
+   │        └─ GraphView 内部 selector（L58）触发重渲染
+   │             └─ <JSONCrack theme={...} />  → 画布层 CSS Variables 更新
    │
    └─→ [L65-66] JSON 数据 + 布局方向同步
 ```
 
-**关键结论**：嵌入页的主题参数通过「双状态分路驱动」保证三层系统一致性，而非由单一状态驱动所有层级。
+**关键结论**：
+- 嵌入页通过「双状态分路驱动」保证三层系统一致性，而非由单一状态驱动所有层级
+- 本地 `theme` state 驱动 UI 框架层：styled-components 是**被动响应**（组件重渲染时 prop 变化）；Mantine 是**主动调用**（useEffect 中调用 setColorScheme）
+- Zustand `darkmodeEnabled` 驱动画布层和持久化
