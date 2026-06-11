@@ -393,12 +393,14 @@ window.addEventListener("message", (event) => {
 });
 ```
 
-**消息格式定义**:
+**消息格式定义**（编译时类型）:
+
+**代码位置**: [widget.tsx L16-L24](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L16-L24)
 
 ```typescript
 interface EmbedMessage {
   data: {
-    json: string;            // ⚠️ 必需字段！没有则整条消息被忽略
+    json?: string;           // 编译时：可选字段
     options?: {
       theme?: "light" | "dark";      // 可选：主题
       direction?: LayoutDirection;   // 可选：布局方向 "RIGHT" | "DOWN" | "LEFT" | "UP"
@@ -407,7 +409,14 @@ interface EmbedMessage {
 }
 ```
 
-> **重要提示**: 虽然 TypeScript 接口中 `json` 在运行时是必需的，但如果为 falsy 值（空字符串、null、undefined 等），整条消息会被静默忽略，不会有任何错误提示。
+**编译时 vs 运行时边界**:
+
+| 层面 | json 字段 | 说明 |
+|------|----------|------|
+| **编译时** | `json?: string`（可选） | TypeScript 允许不传递 json 字段 |
+| **运行时** | 必须为 truthy 值 | `if (!event.data?.json) return;` 会静默忽略 falsy 值 |
+
+> **重要边界**: 类型定义上 `json` 是可选的，但运行时处理逻辑要求 `json` 必须为真值（非空字符串、非 null、非 undefined）才会处理。这是一个"编译时可选，运行时必需"的不一致边界。
 
 ### 4.4 内容下发的完整链路
 
@@ -450,11 +459,13 @@ React.useEffect(() => {
 if (!event.data?.json) return;
 ```
 
-这行代码是整个消息处理的**守门人**：
-- 如果 `event.data.json` 不存在、为 `null`、`undefined` 或空字符串等 falsy 值
-- **整个 handler 函数直接 return**
-- 后续的内容更新、布局方向更新、**主题更新全部被跳过**
-- 没有任何日志或提示，消息被静默忽略
+这行代码是整个消息处理的**守门人**，它创建了一个"编译时可选，运行时必需"的边界：
+
+- **编译时**：`EmbedMessage` 接口中 `json?: string` 是可选字段，TypeScript 不强制要求传递
+- **运行时**：如果 `event.data.json` 不存在、为 `null`、`undefined` 或空字符串等 falsy 值
+  - **整个 handler 函数直接 return**
+  - 后续的内容更新、布局方向更新、**主题更新全部被跳过**
+  - 没有任何日志或提示，消息被**静默忽略**
 
 #### 4.4.2 内容下发完整链路
 
@@ -483,17 +494,24 @@ GraphView 重新渲染
 
 #### 4.4.3 消息有效性判断表
 
-| 消息内容 | 是否有效 | 说明 |
-|---------|---------|------|
-| `{ json: "{}" }` | ✅ 有效 | 只有内容，使用默认布局方向和当前主题 |
-| `{ json: "{}", options: {} }` | ✅ 有效 | 有内容，options 为空，使用默认值 |
-| `{ json: "{}", options: { theme: "dark" } }` | ✅ 有效 | 有内容 + 主题，主题会被处理 |
-| `{ json: "{}", options: { direction: "DOWN" } }` | ✅ 有效 | 有内容 + 布局方向，方向会被处理 |
-| `{ json: "{}", options: { theme: "dark", direction: "DOWN" } }` | ✅ 有效 | 有内容 + 主题 + 方向，全部处理 |
-| `{ options: { theme: "dark" } }` | ❌ 无效 | 没有 json 字段，**全部忽略** |
-| `{ options: { direction: "DOWN" } }` | ❌ 无效 | 没有 json 字段，**全部忽略** |
-| `{ json: "" }` | ❌ 无效 | json 为空字符串（falsy），**全部忽略** |
-| `{ json: null }` | ❌ 无效 | json 为 null，**全部忽略** |
+| 消息内容 | 编译时合法 | 运行时有效 | 说明 |
+|---------|-----------|-----------|------|
+| `{ json: "{}" }` | ✅ 合法 | ✅ 有效 | 只有内容，使用默认布局方向和当前主题 |
+| `{ json: "{}", options: {} }` | ✅ 合法 | ✅ 有效 | 有内容，options 为空，使用默认值 |
+| `{ json: "{}", options: { theme: "dark" } }` | ✅ 合法 | ✅ 有效 | 有内容 + 主题，主题会被处理 |
+| `{ json: "{}", options: { direction: "DOWN" } }` | ✅ 合法 | ✅ 有效 | 有内容 + 布局方向，方向会被处理 |
+| `{ json: "{}", options: { theme: "dark", direction: "DOWN" } }` | ✅ 合法 | ✅ 有效 | 有内容 + 主题 + 方向，全部处理 |
+| `{ options: { theme: "dark" } }` | ✅ 合法 | ❌ 无效 | TypeScript 允许，但运行时**全部忽略** |
+| `{ options: { direction: "DOWN" } }` | ✅ 合法 | ❌ 无效 | TypeScript 允许，但运行时**全部忽略** |
+| `{}` | ✅ 合法 | ❌ 无效 | TypeScript 允许（所有字段都是可选），但运行时**全部忽略** |
+| `{ json: "" }` | ✅ 合法 | ❌ 无效 | json 为空字符串（falsy），**全部忽略** |
+| `{ json: null }` | ⚠️ 不合法 | ❌ 无效 | TypeScript 报错（null 不是 string），但运行时**全部忽略** |
+| `{ json: undefined }` | ✅ 合法 | ❌ 无效 | TypeScript 允许（可选字段），但运行时**全部忽略** |
+
+> **边界说明**: 
+> - 编译时：`json?: string` 允许不传、传 string 或传 undefined
+> - 运行时：`!event.data?.json` 会把 `undefined`、`null`、`""`、`0`、`false`、`NaN` 都当作 falsy 处理
+> - 这意味着 TypeScript 无法捕获"json 为空字符串导致消息被忽略"的错误
 
 **关键点**: 
 - 父页面下发的内容 `hasChanges` 被强制设为 `false`，**不会写入 sessionStorage**
@@ -514,14 +532,19 @@ GraphView 重新渲染
 
 #### 4.5.2 主题下发的前置条件
 
-**关键边界**: [widget.tsx L59](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L59) 的 `if (!event.data?.json) return;` 意味着：
+**关键边界**: [widget.tsx L59](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L59) 的 `if (!event.data?.json) return;` 与 [widget.tsx L18](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L18) 的 `json?: string` 类型定义共同创造了一个边界：
 
-- ❌ **单独发送主题配置会被静默忽略**
-- ✅ **必须同时发送 json 字段，主题才会被处理**
+| 层面 | 约束 | 结论 |
+|------|------|------|
+| **编译时** | `json?: string` 是可选字段 | TypeScript 允许只发送主题不发送 json |
+| **运行时** | `if (!event.data?.json) return;` | ❌ 没有 json 真值，主题更新被**静默忽略** |
 
-**错误示例**（不会生效）:
+- ❌ **单独发送主题配置会被静默忽略**（编译时合法，运行时无效）
+- ✅ **必须同时发送 json 字段（且为真值），主题才会被处理**
+
+**错误示例**（TypeScript 不报错，但运行时不会生效）:
 ```typescript
-// ❌ 没有 json 字段，主题更新被完全忽略
+// ❌ 编译时合法（json 是可选的），但运行时被完全忽略
 iframe.contentWindow.postMessage({
   options: { theme: "dark" }
 }, "*");
@@ -529,9 +552,9 @@ iframe.contentWindow.postMessage({
 
 **正确示例**:
 ```typescript
-// ✅ 附带 json 字段，主题更新才会生效
+// ✅ 编译时合法，运行时生效
 iframe.contentWindow.postMessage({
-  json: JSON.stringify({ hello: "world" }),  // 必须有
+  json: JSON.stringify({ hello: "world" }),  // 必须有且为真值
   options: { theme: "dark" }
 }, "*");
 ```
@@ -582,8 +605,16 @@ UI 重新渲染
 **代码实现**:
 
 ```typescript
+// EmbedMessage 类型定义：json 是可选字段
+interface EmbedMessage {
+  data: {
+    json?: string;           // 编译时：可选
+    options?: { theme?: "light" | "dark" };
+  };
+}
+
 // handler 中的处理逻辑
-if (!event.data?.json) return;  // ⚠️ 没有 json 直接返回
+if (!event.data?.json) return;  // ⚠️ 运行时：没有 json 真值直接返回
 
 // ... 内容更新和方向更新 ...
 
@@ -744,6 +775,7 @@ useConfig.toggleDarkMode(value)
 6. **postMessage 单向通信**: Widget 与父页面的通信是单向的（父→子），仅在初始化时子→父发送 ready 信号
 7. **三层主题同步**: Widget 模式下主题需要同步本地 state、useConfig store 和 Mantine 管理器三层状态
 8. **会话隔离设计**: sessionStorage 的天然隔离特性确保了多标签页编辑内容互不干扰
+9. **编译时/运行时不一致边界**: EmbedMessage 接口中 `json?: string` 是可选字段，但运行时 `if (!event.data?.json) return;` 要求必须为真值，类型系统无法捕获空字符串等边界错误
 
 ### 7.3 跨页面同步边界总结
 
@@ -756,20 +788,30 @@ useConfig.toggleDarkMode(value)
 
 ### 7.4 Widget 消息处理的关键边界
 
-| 边界条件 | 代码位置 | 影响 |
-|---------|---------|------|
-| **json 字段前置校验** | [widget.tsx L59](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L59) | 所有消息必须包含 json 字段，否则被静默忽略 |
-| **主题不能独立下发** | [widget.tsx L59-L63](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L59-L63) | 切换主题必须附带完整 JSON 内容，增加父页面复杂度 |
-| **布局方向不能独立下发** | [widget.tsx L59+L65](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L59) | 切换布局方向必须附带完整 JSON 内容 |
-| **hasChanges=false** | [widget.tsx L65](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L65) | 父页面下发的内容不会写入 sessionStorage |
+| 边界条件 | 代码位置 | 编译时 | 运行时 | 影响 |
+|---------|---------|--------|--------|------|
+| **json 字段类型** | [widget.tsx L18](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L18) | `json?: string` 可选 | - | TypeScript 不强制要求 json 字段 |
+| **json 前置校验** | [widget.tsx L59](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L59) | - | 必须为 truthy 值 | 无 json 真值则整条消息被静默忽略 |
+| **主题不能独立下发** | [widget.tsx L59-L63](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L59-L63) | 允许只发主题 | 必须附带 json 真值 | 编译时合法但运行时无效，容易踩坑 |
+| **布局方向不能独立下发** | [widget.tsx L59+L65](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L59) | 允许只发方向 | 必须附带 json 真值 | 编译时合法但运行时无效 |
+| **hasChanges=false** | [widget.tsx L65](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L65) | - | 内容不持久化 | 父页面下发的内容不会写入 sessionStorage |
 
-**关键代码**（消息处理的守门人）:
+**关键代码对比**（编译时 vs 运行时的不一致）:
 ```typescript
-// widget.tsx L59
-if (!event.data?.json) return;  // ⚠️ 没有 json 字段，直接忽略整条消息
+// widget.tsx L18 - 编译时：json 是可选的
+interface EmbedMessage {
+  data: {
+    json?: string;           // 编译时：可选字段
+    options?: { theme?: "light" | "dark" };
+  };
+}
+
+// widget.tsx L59 - 运行时：json 必须为真值
+if (!event.data?.json) return;  // ⚠️ 没有 json 真值，直接忽略整条消息
 ```
 
 **父页面实现要求**:
 1. 必须缓存当前的 JSON 内容
 2. 切换主题/布局方向时，必须重新发送完整的 JSON + 新配置
 3. 无法实现纯配置更新（如只切换主题不更新内容）
+4. 不要依赖 TypeScript 类型检查来保证运行时行为，需要自行确保 json 为真值
