@@ -417,7 +417,7 @@ React 卸载旧的 JSONCrack 组件，挂载新的 JSONCrack 组件
 
 ### 4.3 主题同步的完整链路
 
-主题切换涉及三层同步：Mantine 主题、styled-components 主题、JSONCrack 组件主题。
+主题切换涉及**五层同步**：Mantine 主题、styled-components 主题、JSONCrack 画布、Monaco 文本编辑器、Schema 弹窗编辑器。
 
 ```
 用户点击 "Dark Mode" 菜单项
@@ -430,25 +430,59 @@ useConfig store 更新 darkmodeEnabled 状态，persist 到 localStorage  [useCo
 │   [editor.tsx#L119-L121] useEffect 监听 darkmodeEnabled 变化
 │   setColorScheme(darkmodeEnabled ? "dark" : "light")
 │   ↓
-│   Mantine 组件库应用新主题
+│   Mantine 组件库应用新主题（按钮、菜单、模态框、Tooltip 等）
 │
 ├─ 第二层：styled-components 主题同步
 │   [editor.tsx#L134] ThemeProvider 接收新 theme
 │   <ThemeProvider theme={darkmodeEnabled ? darkTheme : lightTheme}>
 │   ↓
-│   所有 styled-components 接收新主题变量
+│   所有 styled-components 接收新主题变量（工具栏背景、文字颜色等）
 │
-└─ 第三层：JSONCrack 组件主题同步
-    [GraphView/index.tsx#L101] JSONCrack 接收新 theme prop
-    theme={darkmodeEnabled ? "dark" : "light"}
+├─ 第三层：JSONCrack 画布主题同步
+│   [GraphView/index.tsx#L101] JSONCrack 接收新 theme prop
+│   theme={darkmodeEnabled ? "dark" : "light"}
+│   ↓
+│   JSONCrack 内部应用新的节点颜色、连线颜色、网格颜色等
+│   ⚠️ darkmodeEnabled 不在 key 中，组件不重建，仅 prop 更新
+│
+├─ 第四层：Monaco 文本编辑器主题同步
+│   [TextEditor.tsx#L30] 从 useConfig 读取主题
+│   const theme = useConfig(state => (state.darkmodeEnabled ? "vs-dark" : "light"));
+│   ↓
+│   [TextEditor.tsx#L85] Editor 组件接收新 theme prop
+│   <Editor theme={theme} ... />
+│   ↓
+│   Monaco 编辑器应用新主题（代码高亮、背景色等）
+│
+└─ 第五层：Schema 弹窗 Monaco 编辑器主题同步
+    [SchemaModal/index.tsx#L13] 从 useConfig 读取主题
+    const darkmodeEnabled = useConfig(state => (state.darkmodeEnabled ? "vs-dark" : "light"));
     ↓
-    JSONCrack 内部应用新的节点颜色、连线颜色等
+    [SchemaModal/index.tsx#L69] Editor 组件接收新 theme prop
+    <Editor theme={darkmodeEnabled} ... />
+    ↓
+    当 Schema 弹窗打开时，Monaco 编辑器应用当前主题
 ```
 
 **关键代码位置**：
 - Mantine 同步：[editor.tsx#L119-L121](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/pages/editor.tsx#L119-L121)
 - styled-components 同步：[editor.tsx#L134](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/pages/editor.tsx#L134)
 - JSONCrack 同步：[GraphView/index.tsx#L101](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/index.tsx#L101)
+- Monaco 编辑器同步：[TextEditor.tsx#L30](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/TextEditor.tsx#L30) + [TextEditor.tsx#L85](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/TextEditor.tsx#L85)
+- Schema 弹窗同步：[SchemaModal/index.tsx#L13](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/modals/SchemaModal/index.tsx#L13) + [SchemaModal/index.tsx#L69](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/modals/SchemaModal/index.tsx#L69)
+
+### 4.4 主题触发入口汇总
+
+深浅色模式切换有**四个独立入口**，全部指向同一个 `toggleDarkMode` 动作：
+
+| 入口位置 | 组件 | 触发方式 | 代码位置 |
+|---------|------|---------|---------|
+| 顶部工具栏 | ThemeToggle 按钮 | 点击图标 | [ThemeToggle.tsx#L12](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/Toolbar/ThemeToggle.tsx#L12) |
+| 浮动工具栏 | Preferences 菜单 | 点击菜单项 | [GraphView/Toolbar/index.tsx#L299](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L299) |
+| 底部状态栏 | （无直接入口） | - | - |
+| 快捷键 | （无全局快捷键） | - | - |
+
+**设计特点**：两个入口共用同一个 store 动作，确保状态一致；但按钮的 GA 埋点策略不同（顶部 ThemeToggle 无埋点，浮动工具栏有 `toggle_*` 埋点）。
 
 ---
 
@@ -533,10 +567,13 @@ useConfig store 更新 darkmodeEnabled 状态，persist 到 localStorage  [useCo
 │                   主题切换流程（真实代码）                   │
 └─────────────────────────────────────────────────────────────┘
 
-1. 触发点（三选一）
+1. 触发点（二选一）
    ├─ 顶部工具栏 ThemeToggle 按钮
-   ├─ 浮动工具栏 Preferences → Dark Mode / Light Mode
-   └─ 底部状态栏（无直接按钮）
+   │   [ThemeToggle.tsx#L12] onClick={() => toggleDarkMode(!darkmodeEnabled)}
+   │
+   └─ 浮动工具栏 Preferences 菜单
+       [GraphView/Toolbar/index.tsx#L299] onClick={() => toggleDarkMode(!darkmodeEnabled)}
+       （带 gaEvent("toggle_darkmode", ...) 埋点）
       ↓
 2. 调用 toggleDarkMode(!darkmodeEnabled)
    ↓
@@ -544,24 +581,46 @@ useConfig store 更新 darkmodeEnabled 状态，persist 到 localStorage  [useCo
    ├─ 更新 darkmodeEnabled 状态
    └─ persist 中间件自动保存到 localStorage
       ↓
-4. 三层主题同步
-   ├─ Mantine 主题：[editor.tsx#L119-L121] useEffect
+4. 五层主题同步
+
+   ├─ 第一层：Mantine 主题
+   │   [editor.tsx#L119-L121] useEffect 监听 darkmodeEnabled
    │   setColorScheme(darkmodeEnabled ? "dark" : "light")
+   │   ↓
+   │   影响：所有 Mantine 组件（菜单、按钮、模态框、Tooltip、Popover 等）
    │
-   ├─ styled-components 主题：[editor.tsx#L134]
+   ├─ 第二层：styled-components 主题
+   │   [editor.tsx#L134] ThemeProvider value 变化
    │   <ThemeProvider theme={darkmodeEnabled ? darkTheme : lightTheme}>
    │   ↓
-   │   所有 styled-components 应用新主题变量
+   │   影响：工具栏背景、底部栏、搜索框、文字颜色等自定义样式
    │
-   └─ JSONCrack 组件主题：[GraphView/index.tsx#L99-L101]
-       key={[direction, gesturesEnabled, rulersEnabled].join("-")}
-       theme={darkmodeEnabled ? "dark" : "light"}
+   ├─ 第三层：JSONCrack 画布
+   │   [GraphView/index.tsx#L101] theme prop 更新
+   │   theme={darkmodeEnabled ? "dark" : "light"}
+   │   ↓
+   │   影响：节点背景、连线颜色、网格线、文字颜色
+   │   ⚠️ darkmodeEnabled 不在 key 中 → 组件不重建，仅 prop 更新
+   │
+   ├─ 第四层：Monaco 文本编辑器
+   │   [TextEditor.tsx#L30] 从 useConfig 派生主题字符串
+   │   const theme = useConfig(state => state.darkmodeEnabled ? "vs-dark" : "light")
+   │   ↓
+   │   [TextEditor.tsx#L85] <Editor theme={theme} ... />
+   │   ↓
+   │   影响：代码高亮、编辑器背景、行号、滚动条等
+   │
+   └─ 第五层：Schema 弹窗 Monaco 编辑器
+       [SchemaModal/index.tsx#L13] 从 useConfig 派生主题字符串
+       const darkmodeEnabled = useConfig(state => ... ? "vs-dark" : "light")
        ↓
-       由于 darkmodeEnabled 不在 key 中，组件不会重建，
-       仅通过 prop 更新内部主题
+       [SchemaModal/index.tsx#L69] <Editor theme={darkmodeEnabled} ... />
+       ↓
+       影响：弹窗打开时 Schema 编辑器的配色
+       ⚠️ 仅弹窗打开时生效，关闭时不渲染
       ↓
-5. 图标同步更新
-   ├─ ThemeToggle 按钮：月亮 ↔ 太阳
+5. 图标与文字同步更新
+   ├─ ThemeToggle 按钮图标：月亮 ↔ 太阳
    └─ Preferences 菜单项文字：Dark Mode ↔ Light Mode
 ```
 
@@ -580,7 +639,11 @@ useConfig store 更新 darkmodeEnabled 状态，persist 到 localStorage  [useCo
 | 底部状态栏 | [BottomBar.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/BottomBar.tsx) | 状态指示器、格式切换 | useFile, useConfig, useGraph |
 | 全局快捷键 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L130-L141) | useHotkeys | 多个 store |
 | 画布重建 | [GraphView/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/index.tsx#L99) | React key 变化触发重建 | 无（React 机制） |
-| 主题同步 | [editor.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/pages/editor.tsx#L119-L134) | Mantine + styled-components 双重主题 | useConfig |
+| 主题同步（Mantine） | [editor.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/pages/editor.tsx#L119-L121) | setColorScheme 同步 Mantine 主题 | useConfig |
+| 主题同步（styled-components） | [editor.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/pages/editor.tsx#L134) | ThemeProvider 传递主题 | useConfig |
+| 主题同步（JSONCrack 画布） | [GraphView/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/index.tsx#L101) | theme prop 传递 | useConfig |
+| 主题同步（Monaco 编辑器） | [TextEditor.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/TextEditor.tsx#L30) | theme prop 传递给 @monaco-editor/react | useConfig |
+| 主题同步（Schema 弹窗） | [SchemaModal/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/modals/SchemaModal/index.tsx#L13) | theme prop 传递给弹窗内 Monaco | useConfig |
 
 ---
 
@@ -595,6 +658,9 @@ useConfig store 更新 darkmodeEnabled 状态，persist 到 localStorage  [useCo
 5. **渐进式反馈**：Tooltip 提示 → 视觉状态变化 → Toast 通知 → 模态框，形成完整的反馈链路
 6. **动态可扩展**：模态框系统无需修改核心代码即可添加新模态框
 7. **强制重建机制**：通过 React key 变化确保画布参数变更时完全重建，避免状态污染
+8. **单一数据源**：主题状态由 `useConfig.darkmodeEnabled` 统一管理，五层主题同步都从同一数据源派生，确保一致性
+9. **策略差异化**：主题切换时 JSONCrack 画布通过 prop 更新（不重建），而网格/手势通过 key 变化重建，针对不同场景采用不同的更新策略
+10. **双入口设计**：主题切换有顶部工具栏和浮动工具栏两个入口，共用同一动作但埋点策略不同
 
 ### 7.2 数据流方向
 
