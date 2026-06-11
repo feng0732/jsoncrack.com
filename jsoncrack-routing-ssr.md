@@ -1,12 +1,12 @@
 # JSON Crack — Next.js 路由与 SSR 边界代码梳理
 
-> 重点梳理三个问题：静态导出时 `_document` 按页面渲染的时机、`prefetch={false}` 关闭预取后的跳转方式、查询参数 `?json=` 在浏览器接管后加载数据的完整链路。
+> 三个核心问题：`_app` 全局壳与页面在静态导出预渲染时的执行关系、嵌入页 `push` 路由对象是否真的触发跳转、以及关键代码的定位说明。
 
 ---
 
 ## 1. 基础前提：`output: "export"` 静态导出
 
-文件：[next.config.js](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/next.config.js#L9-L9)
+**配置位置**：`apps/www/next.config.js:L9`
 
 ```js
 const config = {
@@ -18,239 +18,303 @@ const config = {
 };
 ```
 
-`output: "export"` 意味着 `next build` 会产出纯静态文件（HTML/JS/CSS），**没有运行时 Node 服务**。
-这直接决定了：不存在传统意义的 SSR（服务端渲染），只有 SSG（构建时静态生成）。
-所有"SSR"相关代码（`getInitialProps`、`ServerStyleSheet`）都只在**构建期**执行，并且是**按页面逐一执行**。
+`output: "export"` 决定了：
+- 没有运行时 Node 服务，`next build` 只产出纯静态文件（HTML/JS/CSS）
+- **不存在运行时 SSR**，只有构建时的 SSG（静态生成）
+- 所有"SSR 语义"的代码（`getInitialProps`、`ServerStyleSheet`）都**只在构建期**执行
+- **按页面逐一**执行，页面间互不共享状态
 
 ---
 
-## 2. 问题一：`_document` 在静态导出时按页面渲染的时机
+## 2. 问题一：`_app` 全局壳与页面在静态导出预渲染时的执行关系
 
-### 2.1 `_document` 的代码结构
+### 2.1 相关代码定位
 
-文件：[`_document.tsx`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/pages/_document.tsx)
-
-```tsx
-class MyDocument extends Document {
-  static async getInitialProps(ctx: DocumentContext): Promise<DocumentInitialProps> {
-    const sheet = new ServerStyleSheet();              // ① 新建一个 styled-components 样式表
-    const originalRenderPage = ctx.renderPage;
-
-    try {
-      ctx.renderPage = () =>                           // ② 劫持 renderPage
-        originalRenderPage({
-          enhanceApp: App => props => sheet.collectStyles(<App {...props} />),
-        });                                             // 用 collectStyles 包裹 <App />，收集样式
-
-      const initialProps = await Document.getInitialProps(ctx);  // ③ 触发实际渲染
-
-      return {
-        ...initialProps,
-        styles: (
-          <>
-            {initialProps.styles}
-            {sheet.getStyleElement()}                  // ④ 把收集到的样式注入 <head>
-          </>
-        ),
-      };
-    } finally {
-      sheet.seal();
-    }
-  }
-
-  render() {
-    return (
-      <Html lang="en">
-        <Head>
-          <ColorSchemeScript />                        // ⑤ Mantine 防闪烁脚本
-        </Head>
-        <body>
-          <Main />                                     // ⑥ 页面内容占位
-          <NextScript />                               // ⑦ Next.js 运行时脚本
-        </body>
-      </Html>
-    );
-  }
-}
-```
-
-### 2.2 静态导出下的逐页渲染时机（构建流程）
-
-```
-next build 开始
-  │
-  ├─ 扫描 pages 目录，确定所有路由
-  │    /, /editor, /widget, /docs, /legal/privacy, /legal/terms, /404, /_error
-  │
-  │  对每一个页面，独立执行：
-  │
-  │  ┌───────────────────────────────────────────────────────────────┐
-  │  │  页面 N 的渲染周期                                             │
-  │  │                                                               │
-  │  │  1. 执行页面的 getStaticProps（如果有）                         │
-  │  │     → 仅 index.tsx 有，fetch GitHub API 获取 stars             │
-  │  │                                                               │
-  │  │  2. 调用 _document.getInitialProps(ctx)                       │
-  │  │     → ctx 中包含当前页面 pathname、query（构建时为空）         │
-  │  │                                                               │
-  │  │  3. 内部调用 ctx.renderPage() → 被劫持后的版本                 │
-  │  │     → render _app.tsx + 当前 page 组件                        │
-  │  │     → sheet.collectStyles(...) 一路收样式                     │
-  │  │                                                               │
-  │  │  4. Document.getInitialProps 拿到渲染后的 HTML 片段           │
-  │  │                                                               │
-  │  │  5. 拼接 <style> 标签到 styles 字段                           │
-  │  │                                                               │
-  │  │  6. 调用 MyDocument.render() 生成完整 HTML 文档               │
-  │  │     → <Html> / <Head> / <Main> / <NextScript> 全部组装        │
-  │  │                                                               │
-  │  │  7. 输出 .html 文件到 out 目录                                │
-  │  │     （每个页面对应一个独立 .html）                             │
-  │  └───────────────────────────────────────────────────────────────┘
-  │
-  └─ 构建完成 → out/ 目录下所有静态文件
-```
-
-### 2.3 逐页渲染的关键证据
-
-| 证据 | 所在文件 | 说明 |
+| 文件 | 关键行 | 作用 |
 |---|---|---|
-| `ServerStyleSheet` 在 `getInitialProps` 内**每次新建** | [`_document.tsx:8`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/pages/_document.tsx#L8-L8) | 每次调用都 `new ServerStyleSheet()`，说明每个页面独立收集样式，样式不共享 |
-| `finally { sheet.seal() }` | [`_document.tsx:29`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/pages/_document.tsx#L29-L29) | 密封样式表，防止后续写入，是一次性使用的标志 |
-| `ColorSchemeScript` 在 `<Head>` 内 | [`_document.tsx:37`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/pages/_document.tsx#L37-L37) | 每个 HTML 文件都会被注入这段脚本，防止主题闪烁 |
-| 没有 `getServerSideProps` | — | 全项目无 `getServerSideProps`，只有 `getStaticProps` 出现在首页 |
+| `apps/www/src/pages/_document.tsx` | `L7-L31` | `getInitialProps` 劫持渲染入口 |
+| `apps/www/src/pages/_document.tsx` | `L33-L45` | `render()` 输出 HTML 骨架 |
+| `apps/www/src/pages/_app.tsx` | `L70-L121` | 全局壳：Provider 层 + 页面挂载点 |
+| `apps/www/src/pages/index.tsx` | `L32-L49` | 唯一的 `getStaticProps` |
 
-### 2.4 `_app.tsx` 与 `_document.tsx` 的分工
+### 2.2 构建时单个页面的预渲染执行流程
 
-- **`_document.tsx`**：只在构建时运行，负责生成 HTML 骨架（`<html>`、`<head>`、`<body>`、样式收集）。
-- **`_app.tsx`**：构建时运行一次（用于收集样式和生成 HTML），客户端也运行（用于 hydration 和后续渲染）。负责全局 Provider、全局 SEO、全局样式。
-
-文件：[`_app.tsx`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/pages/_app.tsx)
+以下流程对每一个页面（`/`、`/editor`、`/widget`、`/docs`、`/legal/*`、`/404`、`/_error`）**独立执行一次**：
 
 ```
-构建时:
-  _document.getInitialProps
-    → ctx.renderPage()
-      → _app.tsx 作为 App 组件被渲染
-        → 当前页面组件被渲染
-      → 收集 styled-components 样式
-    → 组装完整 HTML 文档
-    → 输出 .html
-
-客户端:
-  浏览器加载 .html
-    → Next.js runtime 启动
-    → hydrate _app.tsx
-    → hydrate 当前页面组件
-    → useEffect 等副作用开始执行
+next build 处理当前页面（例如 /editor）
+  │
+  ├─ 1. 如果页面有 getStaticProps → 先执行
+  │     （仅首页有：fetch GitHub API，产出 { stars }）
+  │
+  ├─ 2. 调用 _document.getInitialProps(ctx)        ← 每页面一次
+  │     │
+  │     ├─ L8: new ServerStyleSheet()              ← 每页面新建，样式不共享
+  │     ├─ L12-L15: ctx.renderPage = () => ...     ← 劫持渲染函数
+  │     │       enhanceApp: App => props =>
+  │     │         sheet.collectStyles(<App {...props} />)
+  │     │                                          ← _app 被 collectStyles 包裹
+  │     │
+  │     ├─ L17: Document.getInitialProps(ctx)      ← 触发实际渲染
+  │     │       │
+  │     │       └─ 内部调用劫持后的 ctx.renderPage()
+  │     │            │
+  │     │            └─ React 渲染以下组件树：
+  │     │                 sheet.collectStyles(
+  │     │                   └─ _app (AppProps)        ← 全局壳渲染
+  │     │                         │
+  │     │                         ├─ <Head>（全局 SEO）
+  │     │                         ├─ <SoftwareApplicationJsonLd>
+  │     │                         ├─ <MantineProvider>
+  │     │                         │    └─ <CodeHighlightAdapterProvider>
+  │     │                         │         └─ <ThemeProvider>
+  │     │                         │              ├─ <Toaster />
+  │     │                         │              ├─ <GlobalStyle />
+  │     │                         │              ├─ <GoogleAnalytics />
+  │     │                         │              └─ <Component {...pageProps} />  ← 当前页面
+  │     │                         │                   （如 EditorPage、HomePage 等）
+  │     │                         │
+  │     │                         └─ (styled-components 样式被 sheet 收集)
+  │     │                 )
+  │     │
+  │     └─ L19-L27: 组装 initialProps.styles，注入 <style> 标签
+  │
+  ├─ 3. 调用 MyDocument.render()                  ← 生成完整 HTML
+  │     └─ 输出：<Html><Head>...</Head><body><Main/><NextScript/></body></Html>
+  │
+  ├─ 4. 输出静态文件：out/editor.html
+  │     包含：HTML + 内联样式 + NextScript 标签（页面 JS 入口）
+  │
+  └─ 5. L29: sheet.seal()                         ← 密封，一次性使用
 ```
+
+### 2.3 关键结论：`_app` 与页面的关系
+
+1. **嵌套关系**：`_app` 是外层壳，页面是 `<Component {...pageProps} />` 子节点。构建时渲染就是一次 React 树的同步渲染。
+
+2. **执行时机**：`_app` 和页面在**同一个 `ctx.renderPage()` 调用内**顺序渲染，先 `_app` 外层，再页面组件。构建时只走同步 render 阶段，**所有 `useEffect` 都不执行**。
+
+3. **每页面独立**：`ServerStyleSheet` 在 `_document.getInitialProps` 中 `new`（`_document.tsx:L8`），最后 `seal()`（`_document.tsx:L29`）。说明每个页面都有**全新的样式表**，页面间样式不交叉。
+
+4. **`getStaticProps` 与 `_document` 的先后**：`getStaticProps` 先执行（首页才有），产出的 `props` 注入到 `AppProps.pageProps`，再传入 `_app`，最终被 `<Component {...pageProps} />` 消费。
+
+### 2.4 构建时 vs 客户端对比
+
+| 阶段 | `_app` 是否执行 | 页面组件是否执行 | `useEffect` 是否执行 | 数据来源 |
+|---|---|---|---|---|
+| 构建时（SSG） | ✅ 是（render 部分） | ✅ 是（render 部分） | ❌ 否 | `getStaticProps`（仅首页） |
+| 客户端 hydration | ✅ 是 | ✅ 是 | ✅ 是 | `useEffect` 中发起 |
+| 客户端路由跳转 | ✅ 保留（只更新 pathname） | ❌ 卸载旧页，挂载新页 | ✅ 新页的 effects 执行 | 同上 |
+
+**`_app` 的特殊地位**：路由跳转时 `_app` **不卸载**，只重新渲染；只有页面组件替换。`_app` 的 `useRouter().pathname` 会变化（`_app.tsx:L71`），触发颜色方案管理器重配置。
 
 ---
 
-## 3. 问题二：`prefetch={false}` 关闭预取后的跳转方式
+## 3. 问题二：嵌入页路由对象 `push` 是否实际触发跳转
 
-### 3.1 所有 `prefetch={false}` 的位置
+### 3.1 代码定位
 
-项目中 `next/link` 的使用**全部**关闭了预取（共 6 处）：
-
-| 位置 | 链接目标 | 所在文件 |
-|---|---|---|
-| Navbar 中间 "Embed" 按钮 | `/docs` | [`Navbar.tsx:90-98`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/layout/PageLayout/Navbar.tsx#L90-L98) |
-| Footer FAQ 链接 | `/#faq` | [`Footer.tsx:54`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/layout/PageLayout/Footer.tsx#L54-L54) |
-| Footer Docs 链接 | `/docs` | [`Footer.tsx:57`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/layout/PageLayout/Footer.tsx#L57-L57) |
-| Footer Terms 链接 | `/legal/terms` | [`Footer.tsx:109`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/layout/PageLayout/Footer.tsx#L109-L109) |
-| Footer Privacy 链接 | `/legal/privacy` | [`Footer.tsx:114`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/layout/PageLayout/Footer.tsx#L114-L114) |
-| Logo 链接 | `/` | [`JSONCrackBrandLogo.tsx:48`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/layout/JSONCrackBrandLogo.tsx#L48-L48) |
-
-**Navbar 中部分按钮直接用 `<a>` 而非 Link**：
-
-- "VS Code"、"Chrome"、"Open Source"、"Upgrade" 都是外部链接，直接用 `component="a"` 搭配 `target="_blank"`
-- "Editor" 按钮使用 `component="a"` + `href="/editor"`（未使用 `next/link`），见 [`Navbar.tsx:125-134`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/layout/PageLayout/Navbar.tsx#L125-L134)
-
-### 3.2 关闭预取后的跳转行为
-
-Next.js Pages Router 中 `prefetch={false}` 的语义：
-
-```
-默认（prefetch=true）:
-  鼠标 hover / 链接进入视口时，预取目标页面的 JS chunk
-  用户点击时 → 立即执行客户端路由切换（SPA 方式），几乎无延迟
-
-prefetch={false}:
-  链接进入视口 / hover 时，不预取任何资源
-  用户点击时 → 先发起网络请求加载目标页面 JS chunk → 再执行客户端路由切换
-  （有明显延迟，取决于网络和 chunk 大小）
-```
-
-在静态导出（`output: "export"`）场景下：
-
-1. **每个页面是独立的 HTML + 独立的 JS chunk**
-2. `prefetch={false}` 意味着首屏只加载当前页面的 JS
-3. 点击跳转时，Next.js 运行时通过 `fetch` / `XMLHttpRequest` 拉取目标页面的 JS bundle
-4. 拉取完成后，React 卸载旧页面、挂载新页面（`_app` 保留，页面组件替换）
-5. URL 通过 `history.pushState` 更新，浏览器**不发生整页刷新**
-
-### 3.3 一个特殊例外：Logo 点击在 widget 页面的行为
-
-文件：[`JSONCrackBrandLogo.tsx:39-45`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/layout/JSONCrackBrandLogo.tsx#L39-L45)
-
+**widget 页面对象解构**：`apps/www/src/pages/widget.tsx:L38`
 ```tsx
-const handleLogoClick = React.useCallback((event: React.MouseEvent<HTMLAnchorElement>) => {
-  if (typeof window === "undefined") return;
-  if (!window.location.href.includes("widget")) return;
-
-  event.preventDefault();
-  window.open("/", "_blank", "noopener,noreferrer");
-}, []);
+const { query, push, isReady } = useRouter();
 ```
 
-- widget 页面内点击 Logo → 不使用 Next.js 路由，而是 `window.open` 打开新标签页
-- 原因：widget 设计为 iframe 嵌入，在 iframe 内跳转没有意义
-
-### 3.4 `useRouter` 的使用情况
-
-| 页面 | 用到的 router API | 用途 |
-|---|---|---|
-| `_app.tsx` | `pathname` | 判断路径以切换颜色方案管理器模式 |
-| `editor.tsx` | `query`, `isReady` | 读取 `?json=` 查询参数加载数据 |
-| `widget.tsx` | `query`, `push`, `isReady` | 读取查询参数 + 程序化跳转 |
-| `_error.tsx` | `router.reload()` | 500 错误页刷新按钮 |
-
-`_app.tsx` 中 `pathname` 的使用见 [`_app.tsx:71-78`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/pages/_app.tsx#L71-L78)：
-
+**`push` 的使用位置**：`apps/www/src/pages/widget.tsx:L54`
 ```tsx
-const { pathname } = useRouter();
-const colorSchemeManager = smartColorSchemeManager({
-  key: "editor-color-scheme",
-  getPathname: () => pathname,
-  dynamicPaths: ["/editor", "/widget"],
-});
+}, [checkEditorSession, clearJson, isReady, push, query.json, query.partner]);
 ```
 
-这里 `pathname` 是**同步**可读的（因为静态导出时路径在构建时就确定了），所以不会有 `isReady` 问题。
+### 3.2 结论：`push` 从未被调用
+
+全项目搜索结果：
+- 没有任何 `router.push(...)`、`router.replace(...)`、`router.back(...)` 调用
+- `widget.tsx` 中的 `push` 只出现在 `useEffect` 的依赖数组里
+- 依赖数组里的变量不会被副作用函数引用执行
+
+**证据链**：
+
+```
+widget.tsx:L38  解构了 push
+        ↓
+widget.tsx:L54  出现在 useEffect deps 中
+        ↓
+useEffect 内部（L47-L53）:
+  - 只调用了 checkEditorSession / clearJson / window.parent.postMessage
+  - 完全没有引用 push 变量
+        ↓
+结论：push 是未使用的依赖，永远不会触发路由跳转
+```
+
+### 3.3 `widget` 页面中实际使用的 router API
+
+| API | 位置 | 用途 |
+|---|---|---|
+| `query` | `widget.tsx:L49` | 读取 `?json=` 和 `?partner=` 查询参数 |
+| `isReady` | `widget.tsx:L48` | 等待 router 解析完 URL（`query` 可用的分界） |
+| `push` | `widget.tsx:L54`（deps 中） | **未使用**，可能是历史遗留或为未来扩展保留 |
+
+### 3.4 `editor` 页面的 router 使用
+
+`apps/www/src/pages/editor.tsx:L103`
+```tsx
+const { query, isReady } = useRouter();
+```
+
+- 只解构了 `query` 和 `isReady`，**没有解构 `push`**
+- 用途与 widget 完全一致：等 `isReady` 后读取 `query?.json` 加载数据
+
+### 3.5 整个项目的路由跳转方式
+
+项目**完全没有程序化路由跳转**（`router.push/replace/back`），所有跳转方式：
+
+| 方式 | 位置 | 说明 |
+|---|---|---|
+| `<Link href>`（`prefetch={false}`） | Navbar、Footer、Logo | 客户端 SPA 跳转，不整页刷新 |
+| `<a href>`（`target="_blank"`） | Navbar 外部链接 | 打开新标签页，指向第三方站点 |
+| `<a href="/editor">` | Navbar "Editor" 按钮 | 不使用 Link，直接用 Mantine `component="a"` 渲染 |
+| `window.open("/", "_blank")` | Logo 在 widget 页面点击 | 主动在新标签页打开首页，不走 Next.js router |
+| `router.reload()` | `_error.tsx:L29` | 500 错误页的"刷新"按钮（整页刷新） |
 
 ---
 
-## 4. 问题三：查询参数 `?json=` 在浏览器接管后加载数据的链路
+## 4. 问题一延伸：`_document` 在静态导出时的逐页渲染时机
 
-### 4.1 入口：`useEffect` + `router.isReady`
+### 4.1 完整构建流程（逐页渲染示意）
 
-查询参数**不能**在 SSR/构建时获取（因为静态导出没有动态路由参数），必须等客户端路由准备就绪。
+```
+next build
+  │
+  ├─ 扫描 apps/www/src/pages/
+  │    发现路由：
+  │      index.tsx        → "/"
+  │      editor.tsx       → "/editor"
+  │      widget.tsx       → "/widget"
+  │      docs.tsx         → "/docs"
+  │      legal/privacy.tsx→ "/legal/privacy"
+  │      legal/terms.tsx  → "/legal/terms"
+  │      404.tsx          → "/404"
+  │      _error.tsx       → "/_error"
+  │
+  │  ┌─ 页面 N 处理开始 ──────────────────────────────┐
+  │  │                                                 │
+  │  │  ① getStaticProps()  ← 仅首页执行               │
+  │  │     fetch("https://api.github.com/...")         │
+  │  │     → { stars: 28347 }                          │
+  │  │                                                 │
+  │  │  ② MyDocument.getInitialProps(ctx)              │
+  │  │     └─ ctx.pathname = 当前页面路径               │
+  │  │                                                 │
+  │  │  ③ 劫持 ctx.renderPage                          │
+  │  │     └─ sheet.collectStyles(<App {...props} />)  │
+  │  │                                                 │
+  │  │  ④ Document.getInitialProps(ctx)                │
+  │  │     └─ 实际调用 renderPage，触发 React 渲染     │
+  │  │        → 输出 HTML 字符串片段                    │
+  │  │        → styled-components 样式收集到 sheet     │
+  │  │                                                 │
+  │  │  ⑤ 合并 styles: {initialProps.styles, sheet}   │
+  │  │                                                 │
+  │  │  ⑥ MyDocument.render()                          │
+  │  │     → 组装完整 HTML 文档：                      │
+  │  │       <Html lang="en">                          │
+  │  │         <Head>                                  │
+  │  │           <ColorSchemeScript />                 │
+  │  │           + SEO meta + JSON-LD                  │
+  │  │           + styled-components <style>           │
+  │  │         </Head>                                 │
+  │  │         <body><Main /><NextScript /></body>     │
+  │  │       </Html>                                   │
+  │  │                                                 │
+  │  │  ⑦ sheet.seal()                                 │
+  │  │                                                 │
+  │  │  ⑧ 写入 out/<page>.html                         │
+  │  │                                                 │
+  │  └─ 页面 N 处理结束 ──────────────────────────────┘
+  │
+  │  （对下一个页面重复以上步骤，8 个页面 × 8 次）
+  │
+  └─ postbuild: next-sitemap 生成 sitemap.xml
+```
 
-#### Editor 页面入口
+### 4.2 每页面独立渲染的代码证据
 
-文件：[`editor.tsx:115-117`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/pages/editor.tsx#L115-L117)
+| 证据 | 位置 | 说明 |
+|---|---|---|
+| `const sheet = new ServerStyleSheet()` | `_document.tsx:L8` | 每次调用 `getInitialProps` 都新建样式表实例 |
+| `sheet.seal()` | `_document.tsx:L29` | 密封后不可写入，是"一次性使用"的明确标志 |
+| 没有页面级别的 `getInitialProps` | — | 只有 `_document` 有 `getInitialProps`，页面组件都不自己声明 |
+| 没有 `getServerSideProps` | — | 无运行时渲染 |
+| 只有首页有 `getStaticProps` | `index.tsx:L32-L49` | 构建时 fetch 一次，star 数内嵌到 HTML |
 
+---
+
+## 5. `prefetch={false}` 关闭预取后的跳转方式
+
+### 5.1 所有关闭预取的位置
+
+项目中 6 处 `next/link` **全部** `prefetch={false}`：
+
+| 位置 | 链接目标 | 文件 |
+|---|---|---|
+| Navbar "Embed" 按钮 | `/docs` | `layout/PageLayout/Navbar.tsx:L90-L98` |
+| Footer FAQ | `/#faq` | `layout/PageLayout/Footer.tsx:L54` |
+| Footer Docs | `/docs` | `layout/PageLayout/Footer.tsx:L57` |
+| Footer Terms | `/legal/terms` | `layout/PageLayout/Footer.tsx:L109` |
+| Footer Privacy | `/legal/privacy` | `layout/PageLayout/Footer.tsx:L114` |
+| Logo | `/` | `layout/JSONCrackBrandLogo.tsx:L48` |
+
+### 5.2 跳转行为
+
+```
+prefetch={false} 语义（静态导出场景）：
+
+  hover / 进入视口 → 不预取目标页面 JS chunk
+        ↓
+  用户点击 <Link>
+        ↓
+  Next.js runtime 发起 fetch 请求加载目标页面 JS bundle
+        ↓
+  JS 加载完成 → React 卸载旧页面组件、挂载新页面组件
+        ↓
+  history.pushState 更新 URL（不触发整页刷新）
+        ↓
+  _app 的 useRouter().pathname 变化 → 重新渲染
+        ↓
+  新页面 useEffect 执行 → 查询参数加载（如果是 editor/widget）
+```
+
+### 5.3 特殊情况：widget 页面 Logo 点击
+
+`layout/JSONCrackBrandLogo.tsx:L39-L45`
+```tsx
+const handleLogoClick = (event) => {
+  if (typeof window === "undefined") return;          // SSR 守卫
+  if (!window.location.href.includes("widget")) return;  // 只在 widget 页面触发
+
+  event.preventDefault();                               // 阻止 Link 默认 SPA 跳转
+  window.open("/", "_blank", "noopener,noreferrer");    // 新标签页打开首页
+};
+```
+
+- 普通页面点击 Logo：正常 `<Link>` 跳转（SPA 方式）
+- widget 页面点击 Logo：`preventDefault` + `window.open`，不经过 Next.js router
+
+---
+
+## 6. 查询参数 `?json=` 在浏览器接管后加载数据的链路
+
+### 6.1 入口：必须等 `router.isReady`
+
+查询参数在静态导出下**不能在构建时/首屏渲染时拿到**。必须等客户端 router 解析 URL 后才可用。
+
+**editor 页面入口**：`pages/editor.tsx:L115-L117`
 ```tsx
 useEffect(() => {
   if (isReady) checkEditorSession(query?.json);
 }, [checkEditorSession, isReady, query]);
 ```
 
-#### Widget 页面入口
-
-文件：[`widget.tsx:47-54`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/pages/widget.tsx#L47-L54)
-
+**widget 页面入口**：`pages/widget.tsx:L47-L54`
 ```tsx
 React.useEffect(() => {
   if (isReady) {
@@ -262,50 +326,57 @@ React.useEffect(() => {
 }, [checkEditorSession, clearJson, isReady, push, query.json, query.partner]);
 ```
 
-关键点：
-- **`isReady` 守卫**：确保 router 已初始化、query 已解析
-- **widget 多一个 `clearJson()` 分支**：没有 `?json=` 时清空（widget 默认空，editor 默认有示例）
-- **widget 多一个 `postMessage`**：通知父窗口 "widget 已就绪"
+### 6.2 为什么必须等 `isReady`
 
-### 4.2 `checkEditorSession` — 入口分发
+静态导出的 Pages Router 中：
+```
+第一次渲染（hydration）
+  router.query = {}  ← 空对象，因为静态 HTML 不含路由参数信息
+  query.json = undefined
 
-文件：[`useFile.ts:142-154`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/store/useFile.ts#L142-L154)
+(isReady === true 后)
+  Next.js 在客户端解析 window.location.search
+  router.query = { json: "https://api.example.com/data" }
+  query.json = "https://api.example.com/data"
+```
+
+**不等 `isReady` 的后果**：首次渲染执行 `checkEditorSession(undefined)`，错误地进入 sessionStorage/示例 JSON 分支，等 URL 解析后再切换，造成内容闪烁。
+
+### 6.3 `checkEditorSession` 分发逻辑
+
+`store/useFile.ts:L142-L154`
 
 ```tsx
 checkEditorSession: (url, widget) => {
-  // 分支 1：url 是合法 URL → 远程 fetch
+  // 分支 A：如果 ?json= 是合法 URL → 远程 fetch
   if (url && typeof url === "string" && isURL(url)) {
     return get().fetchUrl(url);
   }
 
-  // 分支 2：从 sessionStorage 恢复（仅非 widget 模式）
-  let contents = defaultJson;
-  const sessionContent = sessionStorage.getItem("content") as string | null;
-  const format = sessionStorage.getItem("format") as FileFormat | null;
-  if (sessionContent && !widget) contents = sessionContent;
+  // 分支 B：恢复本地内容
+  let contents = defaultJson;                                 // 默认示例 JSON
+  const sessionContent = sessionStorage.getItem("content");   // 读取 sessionStorage
+  const format = sessionStorage.getItem("format");
+  if (sessionContent && !widget) contents = sessionContent;  // widget 模式不使用 sessionStorage
 
   if (format) set({ format });
   get().setContents({ contents, hasChanges: false });
 }
 ```
 
-两个分支：
-1. **`?json=` 是 URL** → `fetchUrl(url)` 远程拉取
-2. **`?json=` 不存在或不是 URL** → 用 `sessionStorage` 里的内容兜底（widget 模式下不用 sessionStorage）
+### 6.4 分支 A：远程 URL 加载
 
-### 4.3 分支 A：URL 远程拉取 `fetchUrl`
-
-文件：[`useFile.ts:129-140`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/store/useFile.ts#L129-L140)
+`store/useFile.ts:L129-L140`
 
 ```tsx
 fetchUrl: async url => {
   try {
-    const res = await fetch(url);
+    const res = await fetch(url);                          // 纯客户端 fetch
     const json = await res.json();
-    const jsonStr = JSON.stringify(json, null, 2);
+    const jsonStr = JSON.stringify(json, null, 2);         // 格式化
 
-    get().setContents({ contents: jsonStr });
-    return useJson.setState({ json: jsonStr, loading: false });
+    get().setContents({ contents: jsonStr });              // 更新编辑器内容
+    return useJson.setState({ json: jsonStr, loading: false }); // 立即更新图形 store
   } catch {
     get().clear();
     toast.error("Failed to fetch document from URL!");
@@ -313,146 +384,159 @@ fetchUrl: async url => {
 },
 ```
 
-特点：
-- 纯客户端 `fetch`，跨域依赖目标服务器的 CORS
-- 拿到数据后格式化为带缩进的 JSON 字符串
-- 同时更新 `useFile.contents`（编辑器内容）和 `useJson.json`（图形渲染数据）
+### 6.5 分支 B：`setContents` 内部链路
 
-### 4.4 分支 B：`setContents` 内部数据处理链路
-
-文件：[`useFile.ts:100-125`](file:///d:/fz/0601/solo-dogfeeding/code/191-jsoncrack.com/apps/www/src/store/useFile.ts#L100-L125)
+`store/useFile.ts:L100-L125`
 
 ```tsx
 setContents: async ({ contents, hasChanges = true, skipUpdate = false, format }) => {
-  try {
-    set({
-      ...(contents && { contents }),
-      error: null,
-      hasChanges,
-      format: format ?? get().format,
-    });
+  // ① 更新本地 store
+  set({ ...(contents && { contents }), error: null, hasChanges,
+       format: format ?? get().format });
 
-    const isFetchURL = window.location.href.includes("?");
-    const json = await contentToJson(get().contents, get().format);
+  // ② 解析为标准化 JSON
+  const json = await contentToJson(get().contents, get().format);
 
-    if (!useConfig.getState().liveTransformEnabled && skipUpdate) return;
+  // ③ 手动模式下如果是"跳过更新"就不渲染图形
+  if (!useConfig.getState().liveTransformEnabled && skipUpdate) return;
 
-    // sessionStorage 持久化（仅内容 < 80KB 且非 iframe 且非 URL 加载场景）
-    if (get().hasChanges && contents && contents.length < 80_000 && !isIframe() && !isFetchURL) {
-      sessionStorage.setItem("content", contents);
-      sessionStorage.setItem("format", get().format);
-      set({ hasChanges: true });
-    }
-
-    debouncedUpdateJson(json);  // 400ms 防抖后更新 useJson store
-  } catch (error: any) {
-    if (error?.mark?.snippet) return set({ error: error.mark.snippet });
-    if (error?.message) set({ error: error.message });
-    useJson.setState({ loading: false });
+  // ④ sessionStorage 持久化
+  //    条件：有变更 + 内容 < 80KB + 非 iframe + 非 URL 加载场景
+  if (get().hasChanges && contents && contents.length < 80_000 && !isIframe() && !isFetchURL) {
+    sessionStorage.setItem("content", contents);
+    sessionStorage.setItem("format", get().format);
   }
+
+  // ⑤ 400ms 防抖后更新 useJson store，触发图形重绘
+  debouncedUpdateJson(json);
 },
 ```
 
-### 4.5 完整链路时序图
+### 6.6 完整时序图（editor 页面）
 
 ```
-浏览器加载 /editor?json=https://api.example.com/data
-
+浏览器请求 /editor?json=https://api.example.com/data
   │
-  ├─ [构建时生成的静态 HTML] 展示骨架
-  │    Toolbar + BottomBar + 空白布局
+  ├─ [构建时生成的静态 editor.html 展示]
+  │    Toolbar + BottomBar + 空白布局（骨架）
+  │    TextEditor / LiveEditor 区域 = 动态加载中占位
   │
   ├─ React hydration 完成
   │
-  ├─ useEffect 第一波执行
-  │    ├─ router.isReady = false → 不做任何事
-  │    └─ (TextEditor / LiveEditor 动态加载中)
+  ├─ useEffect 首次执行
+  │    ├─ isReady === false → checkEditorSession 不执行
+  │    └─ TextEditor + LiveEditor 的 dynamic import 开始下载
   │
-  ├─ Router 准备完毕（isReady = true）
-  │    └─ query.json = "https://api.example.com/data"
+  ├─ Router 解析完成 → isReady = true → query 被填充
   │
   ├─ useEffect 重新执行
-  │    └─ checkEditorSession(query.json)
+  │    └─ checkEditorSession("https://api.example.com/data")
   │         │
   │         ├─ isURL(url) → true
   │         └─ fetchUrl(url)
-  │              │
-  │              ├─ await fetch(url)  ← 网络请求
-  │              ├─ await res.json()
-  │              ├─ JSON.stringify(json, null, 2)
-  │              │
+  │              ├─ fetch(url)         ← 网络请求
+  │              ├─ res.json()         ← 解析响应
+  │              ├─ JSON.stringify(.., null, 2)
   │              ├─ setContents({ contents: jsonStr })
-  │              │    ├─ 更新 useFile.contents
-  │              │    ├─ contentToJson() 解析
-  │              │    └─ debouncedUpdateJson()
-  │              │
+  │              │    ├─ useFile 更新
+  │              │    ├─ contentToJson 转换
+  │              │    └─ debouncedUpdateJson() ← 400ms 计时器启动
   │              └─ useJson.setState({ json, loading: false })
   │
-  ├─ 400ms 防抖后
-  │    └─ debouncedUpdateJson 触发 useJson.setJson
+  ├─ Monaco Editor 加载完成 → 显示编辑器代码
   │
-  ├─ GraphView 检测到 useJson.json 变化
-  │    └─ JSONCrack 组件重绘图形
+  ├─ 400ms 防抖结束 → debouncedUpdateJson 真正写入 useJson
   │
-  └─ 完成：编辑器代码 + 可视化图形 同步展示
+  ├─ GraphView 订阅 useJson.json → JSONCrack 组件重新渲染 SVG 图形
+  │
+  └─ 最终状态：编辑器代码 + 可视化图形 同步显示
 ```
 
-### 4.6 为什么必须等 `isReady`
-
-在静态导出的 Pages Router 中：
-
-1. **第一次渲染**（hydration）：`router.query` 是空对象 `{}`，因为静态 HTML 里没有动态参数信息
-2. **`isReady` 变为 true 后**：Next.js 在客户端解析 URL，填充 `query` 对象
-
-如果去掉 `isReady` 判断，首次渲染时 `query.json` 为 `undefined`，会错误地进入 "无查询参数" 分支，用示例 JSON 或 sessionStorage 内容初始化，等 URL 解析后再切换，造成闪烁。
-
-### 4.7 两个 Store 的分工
+### 6.7 三个 Store 的分工
 
 ```
-useFile store
-  ├─ contents: string     ← 编辑器里的原始文本（可能是 JSON/YAML/CSV/XML）
-  ├─ format: FileFormat   ← 当前文件格式
-  ├─ error: string | null ← 解析错误信息
-  └─ setContents()        ← 入口：设置内容 → 解析 → 防抖更新 useJson
+useFile store  (store/useFile.ts)
+  ├─ contents    编辑器原始文本（支持 JSON/YAML/CSV/XML）
+  ├─ format      当前文件格式
+  ├─ error       解析错误消息
+  ├─ hasChanges  是否有未保存变更
+  ├─ setContents 入口：写入内容 → 解析 → 防抖写入 useJson
+  ├─ fetchUrl    远程 URL 加载
+  └─ checkEditorSession  初始化分发（URL / sessionStorage / 默认值）
 
-useJson store
-  ├─ json: string         ← 标准化后的 JSON 字符串（供图形渲染用）
-  └─ loading: boolean     ← 是否正在加载
+useJson store  (store/useJson.ts)
+  ├─ json        标准化 JSON 字符串（GraphView 直接读取）
+  └─ loading     是否加载中
 
-useGraph store
-  ├─ direction            ← 布局方向
-  ├─ fullscreen           ← 是否全屏
-  └─ viewport / jsonCrackRef ← 视图状态
+useGraph store  (features/editor/views/GraphView/stores/useGraph.ts)
+  ├─ direction   布局方向（RIGHT/DOWN/LEFT/UP）
+  ├─ fullscreen  是否全屏模式
+  └─ viewport    视图坐标
+
+数据流：用户输入/URL fetch → useFile → contentToJson → debouncedUpdateJson → useJson → GraphView
 ```
-
-数据流向：`URL 或用户输入 → useFile → (contentToJson 转换) → useJson → GraphView 渲染`
 
 ---
 
-## 5. 总结：三层边界
+## 7. 三层边界总结
 
-### 5.1 构建时 ↔ 客户端 的边界
+### 7.1 构建时 ↔ 客户端边界
 
-| 侧 | 执行时机 | 关键代码 | 能访问的资源 |
+| 侧 | 执行时机 | 可访问资源 | 关键标记 |
 |---|---|---|---|
-| 构建时（SSG） | `next build` | `_document.getInitialProps`、`getStaticProps`、`_app` 渲染、页面组件渲染 | Node.js API、`fs` 模块（shim 了）、网络（`fetch`） |
-| 客户端 | 浏览器加载后 | `useEffect`、事件处理、动态 import | `window`、`document`、`localStorage`、`sessionStorage`、DOM API |
+| 构建时（SSG） | `next build` 期间 | Node API、网络 fetch（`getStaticProps`） | `output: "export"`、`getStaticProps`、`ServerStyleSheet` |
+| 客户端 | 浏览器加载后 | `window`、`document`、Storage API、DOM | `useEffect`、`typeof window`、`dynamic({ ssr: false })`、`router.isReady` |
 
-**分界标记**：
-- `output: "export"` → 一切 SSR 语义的代码都在构建期执行
-- `dynamic({ ssr: false })` → 组件只在客户端加载，构建时输出空占位
-- `typeof window !== "undefined"` → 运行时环境守卫
-- `useEffect` → 客户端副作用入口
-- `router.isReady` → 查询参数可用的分界点
+**边界标记速查**：
+- `output: "export"` — 全局静态化，无运行时 SSR
+- `getStaticProps` — 构建时数据（仅首页使用）
+- `_document.getInitialProps` — 每页面构建时执行一次
+- `dynamic({ ssr: false })` — 组件仅客户端加载（Monaco、GraphView 等）
+- `useEffect` — 纯客户端副作用入口
+- `router.isReady` — 查询参数从不可用 → 可用的分界点
+- `typeof window === "undefined"` — 运行环境守卫
 
-### 5.2 页面间跳转的边界
+### 7.2 页面间跳转的边界
 
-- `prefetch={false}` → 不预取，点击时才加载目标页面 JS
-- 静态导出下仍是 SPA 跳转（`history.pushState`），不是整页刷新
-- `_app` 保持挂载，页面组件卸载/替换
+| 机制 | 是否整页刷新 | `_app` 是否卸载 |
+|---|---|---|
+| `<Link>` SPA 跳转（`prefetch={false}`） | ❌ 否 | ❌ 保留，只更新 `pathname` |
+| `<a href>` 站内链接（如 Navbar "Editor" 按钮） | ✅ 是（整页导航） | ✅ 卸载，下次再重建 |
+| `window.open` 新标签页 | 新页面 | 完全独立实例 |
+| `router.reload()`（错误页） | ✅ 是（整页刷新） | ✅ 卸载重建 |
 
-### 5.3 查询参数驱动数据加载的边界
+### 7.3 查询参数驱动数据加载的边界
 
-- URL 中有 `?json=...`，但构建时/首屏渲染时拿不到 → `router.isReady` 是分界
-- 数据加载完全走客户端：`fetch` → `useFile` → `useJson` → 图形重渲染
-- 不经过任何服务端（因为没有服务端）
+```
+构建时 / hydration：       query = {}           无 ?json= 数据
+                                  │
+                                  ▼
+router.isReady = true：    query = { json: "..." }  数据可用
+                                  │
+                                  ▼
+checkEditorSession(url)：  分支判断（URL fetch 或 本地恢复）
+                                  │
+                                  ▼
+setContents()：            解析 → 防抖 → useJson 更新
+                                  │
+                                  ▼
+GraphView 重绘：           JSON → 交互式图形
+```
+
+---
+
+## 8. 关键文件索引（相对项目根目录）
+
+| 文件路径 | 关键行 | 角色 |
+|---|---|---|
+| `apps/www/next.config.js` | `L9` | `output: "export"` 全局静态导出 |
+| `apps/www/src/pages/_document.tsx` | `L7-L31`, `L33-L45` | 文档层：样式收集、HTML 骨架、每页面构建时执行 |
+| `apps/www/src/pages/_app.tsx` | `L70-L121` | 应用壳：Providers、全局 SEO、页面挂载点 |
+| `apps/www/src/pages/index.tsx` | `L32-L49` | 首页：唯一使用 `getStaticProps` 的页面 |
+| `apps/www/src/pages/editor.tsx` | `L103`, `L115-L117` | 编辑器：`?json=` 入口、`isReady` 守卫 |
+| `apps/www/src/pages/widget.tsx` | `L38`, `L47-L54` | 嵌入页：解构 `push` 但未调用，`postMessage` 握手 |
+| `apps/www/src/store/useFile.ts` | `L100-L125`, `L129-L140`, `L142-L154` | `setContents`、`fetchUrl`、`checkEditorSession` |
+| `apps/www/src/store/useJson.ts` | 全文 | 图形渲染数据源 store |
+| `apps/www/src/lib/utils/mantineColorScheme.ts` | `L17-L76` | 颜色方案管理器：按路径决定 light/dark |
+| `apps/www/src/layout/PageLayout/Navbar.tsx` | `L90-L98`, `L125-L134` | 导航：`prefetch={false}` 与 `<a>` 混合跳转 |
+| `apps/www/src/layout/JSONCrackBrandLogo.tsx` | `L39-L45`, `L48` | Logo：widget 页面 `window.open` 特殊处理 |
