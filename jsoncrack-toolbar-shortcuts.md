@@ -121,9 +121,40 @@ useHotkeys(
 
 **关键点**：
 - `usePhysicalKeys: true`：使用物理键码，不受键盘布局影响
-- 快捷键与工具栏按钮共享相同的动作处理函数
+- 快捷键与工具栏按钮**共享相同的动作函数**，但按钮点击时会额外调用 `gaEvent` 进行埋点统计
 
-### 2.3 局部快捷键处理
+### 2.3 快捷键与按钮共用动作的真实链路
+
+**部分共用模式**：快捷键直接调用 store 动作，按钮调用时额外增加 GA 埋点。
+
+| 功能 | 快捷键调用 | 按钮调用 | 共用程度 |
+|------|-----------|---------|---------|
+| 放大 | `zoomIn` | `() => { zoomIn(); gaEvent("zoom_in"); }` | 动作函数共用，按钮多埋点 |
+| 缩小 | `zoomOut` | `() => { zoomOut(); gaEvent("zoom_out"); }` | 动作函数共用，按钮多埋点 |
+| 聚焦首节点 | `focusFirstNode` | `() => { focusFirstNode(); gaEvent("focus_first_node"); }` | 动作函数共用，按钮多埋点 |
+| 居中视图 | `centerView` | `() => { centerView(); gaEvent("center_view"); }` | 动作函数共用，按钮多埋点 |
+| 导出 | `() => setVisible("DownloadModal", true)` | `() => setVisible("DownloadModal", true)` | 完全共用 |
+| 搜索 | `handleSearchToggle` | `handleSearchToggle` | 完全共用 |
+| 旋转布局 | `toggleDirection` | `toggleDirection` | 完全共用 |
+
+**代码对比**（[GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx)）：
+
+```typescript
+// 快捷键注册（第132行）- 纯动作调用
+["mod+[plus]", zoomIn, { usePhysicalKeys: true }],
+
+// 按钮点击（第198-210行）- 动作调用 + GA埋点
+<ActionIcon
+  onClick={() => {
+    zoomIn();           // 与快捷键共用的动作
+    gaEvent("zoom_in"); // 按钮独有的埋点
+  }}
+>
+  <LuPlus size={16} />
+</ActionIcon>
+```
+
+### 2.4 局部快捷键处理
 
 在 [SearchInput.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/Toolbar/SearchInput.tsx#L68-L72) 中使用 `getHotkeyHandler` 处理组件级快捷键：
 
@@ -137,7 +168,7 @@ onKeyDown={getHotkeyHandler([
 
 这种方式确保快捷键仅在组件获得焦点时生效，避免与全局快捷键冲突。
 
-### 2.4 快捷键检测与提示
+### 2.5 快捷键检测与提示
 
 在 [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L115-L119) 中检测用户操作系统：
 
@@ -190,30 +221,54 @@ const ModalController = () => {
 
 ### 3.2 Toast 通知反馈
 
-使用 `react-hot-toast` 提供即时操作反馈，支持三种状态：
+使用 `react-hot-toast` 提供即时操作反馈，支持三种状态。
 
-| 状态 | 示例位置 |
-|------|----------|
-| 加载中 | [DownloadModal/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/modals/DownloadModal/index.tsx#L79) |
-| 成功 | [DownloadModal/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/modals/DownloadModal/index.tsx#L102) |
-| 错误 | [DownloadModal/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/modals/DownloadModal/index.tsx#L110) |
+#### 3.2.1 导出图片的真实反馈链路
 
-**代码模式**：
+在 [DownloadModal/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/modals/DownloadModal/index.tsx) 中有两个独立的导出函数：
+
+**1. 复制到剪贴板（clipboardImage）**：
 
 ```typescript
-const exportAsImage = async () => {
+const clipboardImage = async () => {
   try {
-    toast.loading("Downloading...", { id: "toastDownload" });
-    // ... 执行操作
-    toast.success("Download complete");
-  } catch {
-    toast.error("Failed to download image!");
+    toast.loading("Copying to clipboard...", { id: "toastClipboard" });  // 加载状态
+    // ... 执行导出
+    toast.success("Copied to clipboard");  // ✅ 成功提示（真实代码）
+    gaEvent("clipboard_img");
+  } catch (error) {
+    if (error instanceof Error && error.name === "NotAllowedError") {
+      toast.error("Clipboard write permission denied...");  // ❌ 权限错误
+    } else {
+      toast.error("Failed to copy to clipboard");  // ❌ 通用错误
+    }
   } finally {
-    toast.dismiss("toastDownload");  // 确保 loading toast 被清除
+    toast.dismiss("toastClipboard");  // 清除 loading toast
     onClose();
   }
 };
 ```
+
+**2. 下载图片（exportAsImage）**：
+
+```typescript
+const exportAsImage = async () => {
+  try {
+    toast.loading("Downloading...", { id: "toastDownload" });  // 加载状态
+    // ... 执行导出
+    // ⚠️ 真实代码：下载成功没有 toast.success，直接触发浏览器下载
+    downloadURI(dataURI, `${fileDetails.filename}.${extension}`);
+    gaEvent("download_img", { label: extension });
+  } catch {
+    toast.error("Failed to download image!");  // ❌ 失败提示（真实代码）
+  } finally {
+    toast.dismiss("toastDownload");  // 清除 loading toast
+    onClose();
+  }
+};
+```
+
+**重要修正**：下载图片成功时**没有** Toast 成功提示，只有浏览器原生的下载通知。
 
 ### 3.3 视觉状态反馈
 
@@ -262,63 +317,191 @@ variant={searchOpen ? "light" : "subtle"}
 )}
 ```
 
-### 3.4 搜索反馈
+### 3.4 搜索反馈的真实链路
 
-[useFocusNode.ts](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/hooks/useFocusNode.ts) 提供多层次搜索反馈：
+搜索反馈**没有 Toast 通知**，完全通过 DOM 操作和视觉变化实现：
 
-1. **计数反馈**：`{selectedNode + 1} / {nodeCount}` 显示当前位置
-2. **无结果反馈**：红色显示 "No matches"
-3. **视觉高亮**：`highlightMatchedNodes()` 高亮匹配节点
-4. **自动滚动**：`centerFitElementIntoView()` 自动将匹配项滚入视图
+1. **计数反馈**（[SearchInput.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/Toolbar/SearchInput.tsx#L77-L80)）：
+   ```typescript
+   <Counter $none={noResults}>
+     {noResults ? "No matches" : `${selectedNode + 1} / ${nodeCount}`}
+   </Counter>
+   ```
+
+2. **DOM 高亮**（[search.ts](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/lib/utils/search.ts#L12-L17)）：
+   ```typescript
+   export const highlightMatchedNodes = (nodes: NodeListOf<Element>, selectedNode: number) => {
+     for (let i = 0; i < nodes.length; i++) {
+       nodes[i].classList.add("searched");     // 所有匹配项添加 searched 类
+     }
+     nodes[selectedNode].classList.add("highlight");  // 当前选中项添加 highlight 类
+   };
+   ```
+
+3. **自动滚动**（[useFocusNode.ts](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/hooks/useFocusNode.ts#L47-L49)）：
+   ```typescript
+   viewPort?.camera.centerFitElementIntoView(matchedNode, {
+     elementExtraMarginForZoom: 200,
+   });
+   ```
+
+4. **无结果反馈**：当 `hasValue && !hasMatches` 时，`Counter` 组件显示红色 "No matches"
 
 ---
 
-## 4. 完整协作流程
+## 4. 偏好开关影响链路（画布网格、手势、主题同步）
 
-### 4.1 导出图片流程
+### 4.1 偏好开关的真实协作链路
+
+偏好开关在 [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L281-L327) 的 Preferences 菜单中：
+
+```typescript
+<Menu.Dropdown>
+  <Menu.Item onClick={() => toggleDarkMode(!darkmodeEnabled)}>
+    {darkmodeEnabled ? "Light Mode" : "Dark Mode"}
+  </Menu.Item>
+  <Menu.Item onClick={() => toggleGestures(!gesturesEnabled)}>
+    Zoom on Scroll
+  </Menu.Item>
+  <Menu.Item onClick={() => toggleRulers(!rulersEnabled)}>
+    Rulers
+  </Menu.Item>
+</Menu.Dropdown>
+```
+
+### 4.2 画布网格和手势的影响链路
+
+**核心机制**：通过 React `key` 属性变化触发组件完全重建。
+
+在 [GraphView/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/index.tsx#L97-L112) 中：
+
+```typescript
+<JSONCrack
+  ref={jsonCrackRef}
+  // ⚠️ 关键：当 direction、gesturesEnabled、rulersEnabled 任一变化时，
+  // key 变化导致整个 JSONCrack 组件卸载并重新挂载
+  key={[direction, gesturesEnabled, rulersEnabled].join("-")}
+  json={json}
+  theme={darkmodeEnabled ? "dark" : "light"}
+  layoutDirection={direction}
+  showControls={false}
+  showGrid={rulersEnabled}      // 控制网格显示
+  trackpadZoom={gesturesEnabled}  // 控制手势缩放
+  maxRenderableNodes={maxVisibleNodes}
+  centerOnLayout
+  onViewportCreate={setViewPort}
+  onNodeClick={handleNodeClick}
+  onCollapseChange={handleCollapseChange}
+/>
+```
+
+**完整链路**：
+
+```
+用户点击 "Rulers" 菜单项
+    ↓
+toggleRulers(!rulersEnabled)  [GraphView/Toolbar/index.tsx]
+    ↓
+useConfig store 更新 rulersEnabled 状态  [useConfig.ts]
+    ↓
+GraphView 组件重新渲染，读取新的 rulersEnabled  [GraphView/index.tsx]
+    ↓
+JSONCrack 组件的 key 属性变化（"RIGHT-false-true" → "RIGHT-false-false"）
+    ↓
+React 卸载旧的 JSONCrack 组件，挂载新的 JSONCrack 组件
+    ↓
+新组件使用新的 showGrid={rulersEnabled} prop 渲染
+    ↓
+画布网格显示/隐藏
+```
+
+### 4.3 主题同步的完整链路
+
+主题切换涉及三层同步：Mantine 主题、styled-components 主题、JSONCrack 组件主题。
+
+```
+用户点击 "Dark Mode" 菜单项
+    ↓
+toggleDarkMode(!darkmodeEnabled)  [GraphView/Toolbar/index.tsx]
+    ↓
+useConfig store 更新 darkmodeEnabled 状态，persist 到 localStorage  [useConfig.ts]
+    ↓
+├─ 第一层：Mantine 主题同步
+│   [editor.tsx#L119-L121] useEffect 监听 darkmodeEnabled 变化
+│   setColorScheme(darkmodeEnabled ? "dark" : "light")
+│   ↓
+│   Mantine 组件库应用新主题
+│
+├─ 第二层：styled-components 主题同步
+│   [editor.tsx#L134] ThemeProvider 接收新 theme
+│   <ThemeProvider theme={darkmodeEnabled ? darkTheme : lightTheme}>
+│   ↓
+│   所有 styled-components 接收新主题变量
+│
+└─ 第三层：JSONCrack 组件主题同步
+    [GraphView/index.tsx#L101] JSONCrack 接收新 theme prop
+    theme={darkmodeEnabled ? "dark" : "light"}
+    ↓
+    JSONCrack 内部应用新的节点颜色、连线颜色等
+```
+
+**关键代码位置**：
+- Mantine 同步：[editor.tsx#L119-L121](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/pages/editor.tsx#L119-L121)
+- styled-components 同步：[editor.tsx#L134](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/pages/editor.tsx#L134)
+- JSONCrack 同步：[GraphView/index.tsx#L101](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/index.tsx#L101)
+
+---
+
+## 5. 完整协作流程
+
+### 5.1 导出图片流程（真实代码对齐）
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        导出图片流程                          │
+│                   导出图片流程（真实代码）                   │
 └─────────────────────────────────────────────────────────────┘
 
 1. 触发点（二选一）
-   ├─ 工具栏导出按钮点击
-   └─ 快捷键 Ctrl+S / ⌘+S
+   ├─ 工具栏导出按钮点击：onClick={() => setVisible("DownloadModal", true)}
+   └─ 快捷键 Ctrl+S / ⌘+S：["mod+s", () => setVisible("DownloadModal", true)]
       ↓
-2. [GraphView/Toolbar/index.tsx]
-   ├─ onClick 或 useHotkeys 触发
-   └─ 调用 setVisible("DownloadModal", true)
-      ↓
-3. [useModal.ts]
+2. [useModal.ts]
    └─ Zustand store 更新 { DownloadModal: true }
       ↓
-4. [ModalController.tsx]
+3. [ModalController.tsx]
    └─ 监听状态变化，渲染 DownloadModal 组件
       ↓
-5. 用户在模态框中操作后点击 Download
-   ↓
-6. [DownloadModal/index.tsx] exportAsImage()
-   ├─ toast.loading("Downloading...") 显示加载状态
-   ├─ html-to-image 执行导出
-   ├─ 成功：toast.success("Download complete")
-   └─ 失败：toast.error("Failed to download")
+4. 用户在模态框中操作后点击 "Download" 或 "Clipboard"
       ↓
-7. finally 块
+   ├─ 分支 A：点击 Clipboard（clipboardImage 函数）
+   │   ├─ toast.loading("Copying to clipboard...")
+   │   ├─ html-to-image 执行 toBlob
+   │   ├─ navigator.clipboard.write()
+   │   ├─ ✅ 成功：toast.success("Copied to clipboard")
+   │   └─ ❌ 失败：toast.error("Failed to copy to clipboard")
+   │
+   └─ 分支 B：点击 Download（exportAsImage 函数）
+       ├─ toast.loading("Downloading...")
+       ├─ html-to-image 执行 toPng/toJpeg/toSvg
+       ├─ downloadURI() 触发浏览器下载
+       ├─ ⚠️ 成功：无 Toast，只有浏览器下载通知
+       └─ ❌ 失败：toast.error("Failed to download image!")
+      ↓
+5. finally 块
    ├─ toast.dismiss() 清除 loading toast
    └─ onClose() 关闭模态框
 ```
 
-### 4.2 搜索功能流程
+### 5.2 搜索功能流程（真实代码对齐）
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        搜索功能流程                          │
+│                   搜索功能流程（真实代码）                   │
 └─────────────────────────────────────────────────────────────┘
 
 1. 触发点（二选一）
-   ├─ 工具栏搜索按钮点击
-   └─ 快捷键 Ctrl+F / ⌘+F
+   ├─ 工具栏搜索按钮点击：onClick={handleSearchToggle}
+   └─ 快捷键 Ctrl+F / ⌘+F：["mod+f", handleSearchToggle]
       ↓
 2. handleSearchToggle() → setSearchOpen(true)
    ↓
@@ -326,16 +509,16 @@ variant={searchOpen ? "light" : "subtle"}
    ├─ useEffect 自动聚焦输入框
    └─ getHotkeyHandler 注册 Enter/Shift+Enter/Esc
       ↓
-4. 用户输入搜索词
+4. 用户输入搜索词 → setValue(e.currentTarget.value)
    ↓
 5. [useFocusNode.ts]
    ├─ useDebouncedValue 防抖 300ms
-   ├─ searchQuery() 查找匹配节点
-   ├─ highlightMatchedNodes() 高亮显示
+   ├─ searchQuery(`span[data-key*='...' i]`) 查找匹配节点
+   ├─ highlightMatchedNodes() → 添加 .searched 和 .highlight CSS 类
    ├─ centerFitElementIntoView() 自动滚动居中
    └─ 更新 nodeCount 和 selectedNode 状态
       ↓
-6. 界面反馈
+6. 界面反馈（无 Toast）
    ├─ 显示匹配计数："1 / 5"
    └─ 无结果时显示红色 "No matches"
       ↓
@@ -343,17 +526,17 @@ variant={searchOpen ? "light" : "subtle"}
    └─ next()/prev() 更新 selectedNode，重复步骤 5
 ```
 
-### 4.3 主题切换流程
+### 5.3 主题切换流程（真实代码对齐）
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        主题切换流程                          │
+│                   主题切换流程（真实代码）                   │
 └─────────────────────────────────────────────────────────────┘
 
 1. 触发点（三选一）
    ├─ 顶部工具栏 ThemeToggle 按钮
-   ├─ 浮动工具栏 Preferences 菜单
-   └─ 底部状态栏（无直接按钮，可扩展）
+   ├─ 浮动工具栏 Preferences → Dark Mode / Light Mode
+   └─ 底部状态栏（无直接按钮）
       ↓
 2. 调用 toggleDarkMode(!darkmodeEnabled)
    ↓
@@ -361,34 +544,49 @@ variant={searchOpen ? "light" : "subtle"}
    ├─ 更新 darkmodeEnabled 状态
    └─ persist 中间件自动保存到 localStorage
       ↓
-4. [editor.tsx] useEffect 监听状态变化
-   ├─ setColorScheme() 更新 Mantine 主题
-   └─ styled-components ThemeProvider 响应变化
+4. 三层主题同步
+   ├─ Mantine 主题：[editor.tsx#L119-L121] useEffect
+   │   setColorScheme(darkmodeEnabled ? "dark" : "light")
+   │
+   ├─ styled-components 主题：[editor.tsx#L134]
+   │   <ThemeProvider theme={darkmodeEnabled ? darkTheme : lightTheme}>
+   │   ↓
+   │   所有 styled-components 应用新主题变量
+   │
+   └─ JSONCrack 组件主题：[GraphView/index.tsx#L99-L101]
+       key={[direction, gesturesEnabled, rulersEnabled].join("-")}
+       theme={darkmodeEnabled ? "dark" : "light"}
+       ↓
+       由于 darkmodeEnabled 不在 key 中，组件不会重建，
+       仅通过 prop 更新内部主题
       ↓
-5. 全应用主题切换
-   ├─ 所有 styled-components 接收新 theme
-   ├─ 按钮图标切换：月亮 ↔ 太阳
-   └─ 编辑器主题同步更新（monaco-editor）
+5. 图标同步更新
+   ├─ ThemeToggle 按钮：月亮 ↔ 太阳
+   └─ Preferences 菜单项文字：Dark Mode ↔ Light Mode
 ```
 
 ---
 
-## 5. 关键代码路径汇总表
+## 6. 关键代码路径汇总表
 
 | 功能模块 | 入口文件 | 核心逻辑 | 状态管理 |
 |---------|---------|---------|---------|
 | 顶部工具栏 | [Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/Toolbar/index.tsx) | FileMenu, ViewMenu, ToolsMenu | useModal, useFile |
-| 浮动工具栏 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx) | useHotkeys, Tooltip | useGraph, useConfig |
+| 浮动工具栏 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx) | useHotkeys, Tooltip, Preferences 菜单 | useGraph, useConfig, useModal |
 | 搜索功能 | [SearchInput.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/Toolbar/SearchInput.tsx) | getHotkeyHandler, useFocusNode | useGraph |
+| 搜索高亮 | [search.ts](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/lib/utils/search.ts) | DOM classList 操作 | 无（直接操作 DOM） |
 | 模态框系统 | [ModalController.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/modals/ModalController.tsx) | 动态渲染所有模态框 | useModal |
+| 导出反馈 | [DownloadModal/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/modals/DownloadModal/index.tsx) | toast loading/success/error | 无（直接调用 toast） |
 | 底部状态栏 | [BottomBar.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/BottomBar.tsx) | 状态指示器、格式切换 | useFile, useConfig, useGraph |
 | 全局快捷键 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L130-L141) | useHotkeys | 多个 store |
+| 画布重建 | [GraphView/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/index.tsx#L99) | React key 变化触发重建 | 无（React 机制） |
+| 主题同步 | [editor.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/pages/editor.tsx#L119-L134) | Mantine + styled-components 双重主题 | useConfig |
 
 ---
 
-## 6. 设计特点总结
+## 7. 设计特点总结
 
-### 6.1 架构优点
+### 7.1 架构优点
 
 1. **关注点分离**：每个 store 只负责特定领域的状态和动作，职责清晰
 2. **声明式快捷键**：使用 Mantine Hooks 以声明式方式定义快捷键，代码可读性高
@@ -396,28 +594,29 @@ variant={searchOpen ? "light" : "subtle"}
 4. **跨平台兼容**：`mod` 修饰符自动适配不同操作系统
 5. **渐进式反馈**：Tooltip 提示 → 视觉状态变化 → Toast 通知 → 模态框，形成完整的反馈链路
 6. **动态可扩展**：模态框系统无需修改核心代码即可添加新模态框
+7. **强制重建机制**：通过 React key 变化确保画布参数变更时完全重建，避免状态污染
 
-### 6.2 数据流方向
+### 7.2 数据流方向
 
 ```
 用户输入
     ↓
-快捷键/按钮 → 动作函数 → Zustand Store → UI 组件 → 用户反馈
+快捷键/按钮 → 动作函数 (+GA埋点) → Zustand Store → UI 组件 → 用户反馈
     ↑                                                    │
     └──────────────────── 状态订阅 ──────────────────────┘
 ```
 
-### 6.3 快捷键清单
+### 7.3 快捷键清单（对齐真实代码）
 
-| 快捷键 | 功能 | 注册位置 |
-|--------|------|----------|
-| `Ctrl/⌘ + +` | 放大 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L132) |
-| `Ctrl/⌘ + -` | 缩小 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L133) |
-| `Shift + 1` | 聚焦第一个节点 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L134) |
-| `Shift + 2` | 居中视图 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L135) |
-| `Ctrl/⌘ + F` | 搜索节点 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L136) |
-| `Ctrl/⌘ + S` | 导出图片 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L137) |
-| `Ctrl/⌘ + Shift + D` | 旋转布局 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L138) |
-| `Enter` | 下一个匹配项（搜索时） | [SearchInput.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/Toolbar/SearchInput.tsx#L69) |
-| `Shift + Enter` | 上一个匹配项（搜索时） | [SearchInput.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/Toolbar/SearchInput.tsx#L70) |
-| `Escape` | 关闭搜索 | [SearchInput.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/Toolbar/SearchInput.tsx#L71) |
+| 快捷键 | 功能 | 注册位置 | 与按钮共用动作 |
+|--------|------|----------|---------------|
+| `Ctrl/⌘ + +` | 放大 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L132) | 共用 zoomIn，按钮多 gaEvent |
+| `Ctrl/⌘ + -` | 缩小 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L133) | 共用 zoomOut，按钮多 gaEvent |
+| `Shift + 1` | 聚焦第一个节点 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L134) | 共用 focusFirstNode，按钮多 gaEvent |
+| `Shift + 2` | 居中视图 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L135) | 共用 centerView，按钮多 gaEvent |
+| `Ctrl/⌘ + F` | 搜索节点 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L136) | 完全共用 handleSearchToggle |
+| `Ctrl/⌘ + S` | 导出图片 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L137) | 完全共用 setVisible |
+| `Ctrl/⌘ + Shift + D` | 旋转布局 | [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L138) | 完全共用 toggleDirection |
+| `Enter` | 下一个匹配项（搜索时） | [SearchInput.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/Toolbar/SearchInput.tsx#L69) | 完全共用 next |
+| `Shift + Enter` | 上一个匹配项（搜索时） | [SearchInput.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/Toolbar/SearchInput.tsx#L70) | 完全共用 prev |
+| `Escape` | 关闭搜索 | [SearchInput.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/Toolbar/SearchInput.tsx#L71) | 完全共用 handleClose |
