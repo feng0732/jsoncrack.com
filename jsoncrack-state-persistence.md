@@ -76,13 +76,13 @@ export function smartColorSchemeManager({
 **存储逻辑**:
 - 仅在 `/editor` 和 `/widget` 路径下使用动态主题（持久化）
 - 其他路径强制使用 `light` 主题（不持久化）
-- 使用内存变量 `currentColorScheme` 作为缓存，优先从内存读取
+- 使用内存变量 `currentColorScheme` 作为缓存，一旦缓存有值就不再读取 localStorage
 
 **相关代码**:
-- `get()`: 读取主题，动态路径下优先内存，再读 localStorage
-- `set(value)`: 设置主题，动态路径下同时更新内存和 localStorage
+- `get()`: 读取主题。动态路径下，如果内存缓存 `currentColorScheme` 不为 null，**直接返回缓存值，不再读取 localStorage**；只有缓存为 null 时（首次调用或 `clear()` 之后），才会从 localStorage 读取
+- `set(value)`: 设置主题，动态路径下同时更新内存缓存和 localStorage
 - `subscribe/unsubscribe`: 空实现（不支持订阅）
-- `clear()`: 清除内存和 localStorage 中的值
+- `clear()`: 将内存缓存 `currentColorScheme` 置为 null，同时删除 localStorage 中的值；这是唯一能让后续 `get()` 重新读取 localStorage 的方式
 
 **使用位置**: [_app.tsx](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/_app.tsx#L73-L78)
 
@@ -298,9 +298,39 @@ Zustand 的 `persist` 中间件默认不支持跨标签页同步：
 
 #### 4.2.3 Mantine 主题管理器的同步边界
 
-**文件**: [mantineColorScheme.ts](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/lib/utils/mantineColorScheme.ts#L66-L68)
+**文件**: [mantineColorScheme.ts](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/lib/utils/mantineColorScheme.ts#L31-L49)
 
-`smartColorSchemeManager` 的 `subscribe` 和 `unsubscribe` 是空实现：
+`smartColorSchemeManager` 的内存缓存 `currentColorScheme` 存在一个关键边界：
+
+```typescript
+get: defaultValue => {
+  if (!shouldUseDynamicBehavior()) return "light";
+
+  // ⚠️ 关键：缓存不为 null 时直接返回，永远不再读取 localStorage
+  if (currentColorScheme) return currentColorScheme;
+
+  // 只有缓存为 null（首次调用或 clear() 之后）才会执行到这里
+  currentColorScheme =
+    (window.localStorage.getItem(key) as MantineColorScheme) || defaultValue;
+  return currentColorScheme;
+},
+```
+
+这意味着：
+
+| 缓存状态 | `get()` 行为 | 读取 localStorage？ |
+|---------|-------------|-------------------|
+| `currentColorScheme` 不为 null | 直接返回缓存值 | ❌ 不读取 |
+| `currentColorScheme` 为 null | 从 localStorage 读取并缓存 | ✅ 读取 |
+
+**缓存不可自动失效**：
+- 一旦 `currentColorScheme` 被赋值（通过 `set()` 或首次 `get()`），后续所有 `get()` 调用都只返回缓存值
+- 即使 localStorage 被其他标签页或代码修改，缓存也不会感知
+- **只有两种方式能让 `get()` 重新读取 localStorage**：
+  1. 调用 `clear()` 将 `currentColorScheme` 置为 null
+  2. 页面重新加载，`smartColorSchemeManager` 重新创建，`currentColorScheme` 初始为 null
+
+`subscribe` 和 `unsubscribe` 是空实现，进一步确认没有跨标签页同步机制：
 
 ```typescript
 return {
@@ -311,11 +341,6 @@ return {
   // ...
 };
 ```
-
-这意味着：
-- Mantine 无法感知其他标签页的主题变更
-- 内存缓存 `currentColorScheme` 会保持旧值，即使 localStorage 已被其他标签页修改
-- 只有重新调用 `get()` 时才会读取最新的 localStorage 值
 
 #### 4.2.4 sessionStorage 的天然隔离
 
@@ -644,10 +669,11 @@ React.useEffect(() => {
    - `setColorScheme` 会写入 localStorage "editor-color-scheme"
    - 但父页面无法感知这些变化（postMessage 是单向的）
 
-3. **内存缓存导致的过期值**:
-   - `smartColorSchemeManager` 的 `currentColorScheme` 内存缓存
-   - 如果其他代码直接修改 localStorage，Mantine 不会感知
-   - 必须通过 `setColorScheme` API 更新才能保证一致性
+3. **内存缓存不可自动失效，导致过期值**:
+   - `smartColorSchemeManager` 的 `currentColorScheme` 内存缓存一旦赋值，`get()` 永远不再读取 localStorage
+   - 即使 localStorage 被其他标签页或代码修改，缓存也不会感知
+   - 只有调用 `clear()` 或页面重新加载（重新创建 manager 实例）才能让缓存失效
+   - 必须通过 `setColorScheme` API（即 `set()`）更新内存缓存才能保证一致性，直接修改 localStorage 无效
 
 4. **主题无法独立切换**:
    - 只想切换主题时，必须重新发送完整的 JSON 内容
