@@ -353,21 +353,54 @@ variant={searchOpen ? "light" : "subtle"}
 
 ### 4.1 偏好开关的真实协作链路
 
-偏好开关在 [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L281-L327) 的 Preferences 菜单中：
+偏好开关在 [GraphView/Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L295-L326) 的 Preferences 菜单中。
+
+**三个偏好开关的真实 onClick 代码**：
 
 ```typescript
-<Menu.Dropdown>
-  <Menu.Item onClick={() => toggleDarkMode(!darkmodeEnabled)}>
-    {darkmodeEnabled ? "Light Mode" : "Dark Mode"}
-  </Menu.Item>
-  <Menu.Item onClick={() => toggleGestures(!gesturesEnabled)}>
-    Zoom on Scroll
-  </Menu.Item>
-  <Menu.Item onClick={() => toggleRulers(!rulersEnabled)}>
-    Rulers
-  </Menu.Item>
-</Menu.Dropdown>
+// 1. 主题切换（第296-303行）—— ⚠️ 无 gaEvent 埋点
+<Menu.Item
+  leftSection={darkmodeEnabled ? <FaSun /> : <FaMoon />}
+  onClick={() => toggleDarkMode(!darkmodeEnabled)}      // 仅调用 store 动作
+  closeMenuOnClick={false}
+>
+  {darkmodeEnabled ? "Light Mode" : "Dark Mode"}
+</Menu.Item>
+
+// 2. 滚轮缩放（第304-313行）—— ✅ 有 gaEvent 埋点
+<Menu.Item
+  rightSection={<BsCheck2 display={gesturesEnabled ? "initial" : "none"} />}
+  onClick={() => {
+    toggleGestures(!gesturesEnabled);
+    gaEvent("toggle_gestures", { label: gesturesEnabled ? "on" : "off" });
+  }}
+  closeMenuOnClick={false}
+>
+  Zoom on Scroll
+</Menu.Item>
+
+// 3. 标尺开关（第315-325行）—— ✅ 有 gaEvent 埋点
+<Menu.Item
+  rightSection={<BsCheck2 display={rulersEnabled ? "initial" : "none"} />}
+  onClick={() => {
+    toggleRulers(!rulersEnabled);
+    gaEvent("toggle_rulers", { label: rulersEnabled ? "on" : "off" });
+  }}
+  closeMenuOnClick={false}
+>
+  Rulers
+</Menu.Item>
 ```
+
+**三个偏好开关的事件记录差异**：
+
+| 偏好项 | store 动作 | gaEvent 事件名 | label 值 | 含义 |
+|--------|-----------|---------------|---------|------|
+| Dark Mode / Light Mode | `toggleDarkMode(!darkmodeEnabled)` | **无** | - | 主题切换未被埋点追踪 |
+| Zoom on Scroll | `toggleGestures(!gesturesEnabled)` | `"toggle_gestures"` | 切换前的状态 `"on"` / `"off"` | 记录"从哪个状态离开" |
+| Rulers | `toggleRulers(!rulersEnabled)` | `"toggle_rulers"` | 切换前的状态 `"on"` / `"off"` | 记录"从哪个状态离开" |
+
+**注意**：gaEvent 的 label 记录的是切换**前**的状态值（闭包捕获），即"用户离开的状态"，而非"用户切换到的状态"。
 
 ### 4.2 画布网格和手势的影响链路
 
@@ -473,16 +506,16 @@ useConfig store 更新 darkmodeEnabled 状态，persist 到 localStorage  [useCo
 
 ### 4.4 主题触发入口汇总
 
-深浅色模式切换有**四个独立入口**，全部指向同一个 `toggleDarkMode` 动作：
+深浅色模式切换有**两个独立入口**，全部指向同一个 `toggleDarkMode` 动作：
 
-| 入口位置 | 组件 | 触发方式 | 代码位置 |
-|---------|------|---------|---------|
-| 顶部工具栏 | ThemeToggle 按钮 | 点击图标 | [ThemeToggle.tsx#L12](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/Toolbar/ThemeToggle.tsx#L12) |
-| 浮动工具栏 | Preferences 菜单 | 点击菜单项 | [GraphView/Toolbar/index.tsx#L299](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L299) |
-| 底部状态栏 | （无直接入口） | - | - |
-| 快捷键 | （无全局快捷键） | - | - |
+| 入口位置 | 组件 | 触发方式 | GA 埋点 | 代码位置 |
+|---------|------|---------|---------|---------|
+| 顶部工具栏 | ThemeToggle 按钮 | 点击图标 | **无** | [ThemeToggle.tsx#L12](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/Toolbar/ThemeToggle.tsx#L12) |
+| 浮动工具栏 | Preferences 菜单 | 点击菜单项 | **无** | [GraphView/Toolbar/index.tsx#L299](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/views/GraphView/Toolbar/index.tsx#L299) |
+| 底部状态栏 | （无直接入口） | - | - | - |
+| 快捷键 | （无全局快捷键） | - | - | - |
 
-**设计特点**：两个入口共用同一个 store 动作，确保状态一致；但按钮的 GA 埋点策略不同（顶部 ThemeToggle 无埋点，浮动工具栏有 `toggle_*` 埋点）。
+**设计特点**：两个入口共用同一个 store 动作，且**均无 GA 埋点**。与同一 Preferences 菜单中的滚轮缩放（`"toggle_gestures"`）和标尺开关（`"toggle_rulers"`）不同，主题切换未被埋点追踪。
 
 ---
 
@@ -567,13 +600,13 @@ useConfig store 更新 darkmodeEnabled 状态，persist 到 localStorage  [useCo
 │                   主题切换流程（真实代码）                   │
 └─────────────────────────────────────────────────────────────┘
 
-1. 触发点（二选一）
+1. 触发点（二选一，均无 GA 埋点）
    ├─ 顶部工具栏 ThemeToggle 按钮
    │   [ThemeToggle.tsx#L12] onClick={() => toggleDarkMode(!darkmodeEnabled)}
    │
    └─ 浮动工具栏 Preferences 菜单
        [GraphView/Toolbar/index.tsx#L299] onClick={() => toggleDarkMode(!darkmodeEnabled)}
-       （带 gaEvent("toggle_darkmode", ...) 埋点）
+       （⚠️ 无 gaEvent，与滚轮缩放/标尺开关不同）
       ↓
 2. 调用 toggleDarkMode(!darkmodeEnabled)
    ↓
@@ -660,7 +693,7 @@ useConfig store 更新 darkmodeEnabled 状态，persist 到 localStorage  [useCo
 7. **强制重建机制**：通过 React key 变化确保画布参数变更时完全重建，避免状态污染
 8. **单一数据源**：主题状态由 `useConfig.darkmodeEnabled` 统一管理，五层主题同步都从同一数据源派生，确保一致性
 9. **策略差异化**：主题切换时 JSONCrack 画布通过 prop 更新（不重建），而网格/手势通过 key 变化重建，针对不同场景采用不同的更新策略
-10. **双入口设计**：主题切换有顶部工具栏和浮动工具栏两个入口，共用同一动作但埋点策略不同
+10. **埋点策略不一致**：Preferences 菜单中滚轮缩放和标尺开关有 gaEvent 埋点（记录切换前状态），但主题切换无埋点；浮动工具栏的缩放/居中按钮有 gaEvent，但对应的快捷键无 gaEvent
 
 ### 7.2 数据流方向
 
