@@ -182,7 +182,7 @@ const getElk = async () => {
 | **跨组件复用** | 如果有多个 JSONCrack 组件（例如多标签页场景），它们会共用同一个 Worker |
 | **Node.js 环境** | 使用 `elk.bundled.js`（无 Worker），但同样是单例 |
 
-**重要**：Chrome 扩展禁用 Worker 的机制之所以有效，是因为它在 `import("jsoncrack-react")` 之前就将 `Worker` 置为 `undefined`，导致 `workerFactory` 中 `new Worker()` 检测失败，ELK 自动回退到同步模式。一旦 ELK 实例创建完毕（模式已确定），后续即使恢复 `globalThis.Worker` 也不会改变。
+**重要**：Chrome 扩展禁用 Worker 的机制之所以有效，是因为它在 `import("jsoncrack-react")` 之前就将 `Worker` 置为 `undefined`，导致 `elkLayout.ts` 模块顶层的 `isBrowser = typeof Worker !== 'undefined'` 判断为 `false`，从而走 `elk.bundled.js` 同步分支（不会执行到 `workerFactory` 代码路径）。一旦 `isBrowser` 在模块加载时求值完毕（模式已确定），后续即使恢复了 `globalThis.Worker` 也不会改变。
 
 ---
 
@@ -200,10 +200,10 @@ Worker 的创建由 `getElk()` 函数控制，关键触发条件：
 2. **懒加载创建**：通过 `await import('elkjs/lib/elk-api')` 动态导入 elk-api.js，随后立即在 `workerFactory` 中 `new Worker(...)` 创建 Worker
 3. **单例模式**：创建后写入模块级变量 `elkInstance`，后续所有布局复用此实例
 
-**实际创建条件**（必须同时满足）：
+**实际创建条件**（必须同时满足才走 Worker 分支）：
 - 浏览器环境：`typeof window !== 'undefined' && typeof Worker !== 'undefined'`
-  - 若 `Worker === undefined`（如 Chrome 扩展的 CSP 场景），`isBrowser` 判断为 `false`，回退到同步 bundled 模式
-  - 若浏览器原生不支持 Worker，同样回退
+  - 若 `Worker === undefined`（如 Chrome 扩展中临时禁用的场景），`isBrowser` 判断为 `false`，走 `elk.bundled.js` 同步分支（不创建 Worker）
+  - 若浏览器原生不支持 Worker，同样走同步分支
 
 ### 4.2 空闲状态
 
@@ -253,8 +253,8 @@ Worker 的创建由 `getElk()` 函数控制，关键触发条件：
 - 关闭 panel 时用户侧的清理（`onDidDispose`）仅清理 Node.js 侧监听器，不直接影响 Worker，但 webview 上下文整体销毁时 Worker 必然终止
 
 #### Chrome 扩展（同步模式，无 Worker）
-- 用户切换回 "Raw" 模式：`graphRoot.unmount()` → React 组件卸载 → 同步 ELK 实例被 GC 回收
-- 但 `elkInstance` 单例变量仍在 content script 模块作用域中，只有整页刷新时才真正重置
+- 用户切换回 "Raw" 模式：`graphRoot.unmount()` → React 组件卸载 → `useLayout` 的 Promise 被 cancel，但 **`elkInstance` 同步单例不释放**（模块作用域变量持续存在）
+- 只有宿主页面刷新 / 导航跳转 / 扩展被禁用 → content script 隔离世界销毁 → 模块重新执行 → 单例才真正重置
 
 ### 4.5 生命周期状态机（修正版）
 
