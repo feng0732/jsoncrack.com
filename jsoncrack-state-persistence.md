@@ -263,46 +263,284 @@ useEffect(() => {
 
 ## 四、跨页面/标签页同步
 
-### 4.1 现状：无跨标签页同步
+### 4.1 现状：无跨标签页实时同步
 
-经过代码分析，JSON Crack **没有实现**跨浏览器标签页的状态同步机制：
+经过代码分析，JSON Crack **没有实现**跨浏览器标签页的实时状态同步机制：
 
 - ❌ 未使用 `BroadcastChannel` API
 - ❌ 未监听 `storage` 事件（`window.addEventListener('storage', ...)`）
 - ❌ 未使用 `SharedWorker`
 - ❌ 未使用 IndexedDB
 
-### 4.2 各标签页状态独立性
+### 4.2 多标签页无实时同步的边界条件
 
-每个浏览器标签页拥有独立的状态：
+#### 4.2.1 存储层面的边界
 
-| 存储类型 | 跨标签页共享 | 自动同步 | 说明 |
-|---------|-------------|---------|------|
-| localStorage | ✅ 是 | ❌ 否 | 数据共享，但需要刷新页面才能看到其他标签页的更改 |
-| sessionStorage | ❌ 否 | ❌ 否 | 每个标签页独立，数据不共享 |
+| 存储类型 | 跨标签页共享 | 自动同步 | 同步边界 |
+|---------|-------------|---------|---------|
+| localStorage | ✅ 是 | ❌ 否 | 数据在磁盘层面共享，但无事件通知机制 |
+| sessionStorage | ❌ 否 | ❌ 否 | 每个标签页完全独立，数据不共享 |
 
-**localStorage 的隐式共享**:
-- localStorage 本身是同源共享的
-- 但由于没有监听 `storage` 事件，其他标签页的更改不会实时反映
-- 需要手动刷新页面才能获取最新的 localStorage 数据
+**localStorage 的隐式共享但不同步**:
+- localStorage 本身是同源共享的，多个标签页读取同一个物理存储
+- 但由于没有监听 `storage` 事件，标签页 A 的更改不会实时推送到标签页 B
+- 标签页 B 只有在**重新读取 localStorage 时**（如页面刷新、store 重新初始化）才能看到最新值
+- 示例：标签页 A 切换暗色模式 → localStorage 更新 → 标签页 B 仍显示亮色 → 刷新标签页 B 后才变为暗色
 
-### 4.3 Widget 与父窗口的同步
+#### 4.2.2 Zustand persist 的同步边界
 
-Widget 嵌入模式通过 `postMessage` 实现与父窗口的单向通信（父→子）：
+**文件**: [useConfig.ts](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/store/useConfig.ts#L18-L31)
+
+Zustand 的 `persist` 中间件默认不支持跨标签页同步：
+- 仅在 store 创建时从 localStorage 读取一次
+- 状态变更时写入 localStorage，但不会通知其他标签页
+- 其他标签页的 store 内存状态保持不变，直到重新初始化
+
+#### 4.2.3 Mantine 主题管理器的同步边界
+
+**文件**: [mantineColorScheme.ts](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/lib/utils/mantineColorScheme.ts#L66-L68)
+
+`smartColorSchemeManager` 的 `subscribe` 和 `unsubscribe` 是空实现：
 
 ```typescript
-// 父窗口发送消息
-window.postMessage({
-  json: "...",
-  options: {
-    theme: "dark",
-    direction: "RIGHT"
-  }
-}, "*");
-
-// Widget 接收并更新状态
-// 参见 widget.tsx 中的 message 事件监听
+return {
+  // ...
+  // These do nothing regardless of path
+  subscribe: () => {},
+  unsubscribe: () => {},
+  // ...
+};
 ```
+
+这意味着：
+- Mantine 无法感知其他标签页的主题变更
+- 内存缓存 `currentColorScheme` 会保持旧值，即使 localStorage 已被其他标签页修改
+- 只有重新调用 `get()` 时才会读取最新的 localStorage 值
+
+#### 4.2.4 sessionStorage 的天然隔离
+
+**文件**: [useFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/store/useFile.ts#L114-L117)
+
+sessionStorage 是浏览器级别的标签页隔离机制：
+- 每个标签页拥有独立的 sessionStorage 存储空间
+- 即使是同一个 URL 打开的多个标签页，sessionStorage 也不共享
+- 标签页关闭后 sessionStorage 自动清除
+- 这意味着：在标签页 A 编辑的内容，标签页 B 完全看不到
+
+### 4.3 Widget 嵌入页面与父页面的消息往返
+
+#### 4.3.1 完整消息时序图
+
+```
+父页面（包含 iframe）                     Widget 页面（iframe 内）
+     |                                          |
+     |  1. 创建 iframe，src=/widget             |
+     |----------------------------------------->|
+     |                                          |  2. Widget 初始化完成
+     |                                          |  3. 发送 ready 信号
+     |<-----------------------------------------|
+     |      postMessage(iframe.id, "*")         |
+     |                                          |
+     |  4. 父页面收到 ready 信号                |
+     |  5. 下发 JSON 数据和配置                 |
+     |----------------------------------------->|
+     |      postMessage({json, options}, "*")   |
+     |                                          |  6. Widget 接收并更新状态
+     |                                          |  7. 渲染图形
+```
+
+#### 4.3.2 Widget 初始化与 ready 信号
+
+**文件**: [widget.tsx](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L47-L54)
+
+```typescript
+React.useEffect(() => {
+  if (isReady) {
+    if (typeof query?.json === "string") checkEditorSession(query.json, true);
+    else clearJson();
+
+    // 发送 ready 信号给父窗口
+    window.parent.postMessage(window.frameElement?.getAttribute("id"), "*");
+  }
+}, [checkEditorSession, clearJson, isReady, push, query.json, query.partner]);
+```
+
+**关键细节**:
+- Widget 加载完成后，将 iframe 的 `id` 属性作为消息内容发送给父窗口
+- 父页面通过匹配此 id 来识别哪个 Widget 已就绪
+- 这是**子→父**的唯一消息（其他消息都是**父→子**）
+
+#### 4.3.3 父页面监听与消息下发
+
+**文档示例**: [docs.tsx](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/docs.tsx#L44-L58)
+
+```typescript
+// 父页面代码
+const iframe = document.getElementById("json-crack-embed");
+
+// 等待 Widget 发出 ready 信号
+window.addEventListener("message", (event) => {
+  if (event.data === "json-crack-embed") {
+    // Widget 已就绪，发送数据
+    iframe.contentWindow.postMessage({
+      json: JSON.stringify({ hello: "world" }),
+      options: {
+        theme: "light",
+        direction: "DOWN"
+      }
+    }, "*");
+  }
+});
+```
+
+**消息格式定义**:
+
+```typescript
+interface EmbedMessage {
+  data: {
+    json?: string;           // JSON 字符串
+    options?: {
+      theme?: "light" | "dark";      // 主题
+      direction?: LayoutDirection;   // 布局方向: "RIGHT" | "DOWN" | "LEFT" | "UP"
+    };
+  };
+}
+```
+
+### 4.4 内容下发的完整链路
+
+**文件**: [widget.tsx](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx#L56-L75)
+
+```typescript
+React.useEffect(() => {
+  const handler = (event: EmbedMessage) => {
+    try {
+      if (!event.data?.json) return;
+      
+      // 1. 内容更新
+      setContents({ contents: event.data.json, hasChanges: false });
+      
+      // 2. 布局方向更新
+      setDirection(event.data.options?.direction || "RIGHT");
+      
+      // 3. 主题更新（见下文）
+      if (event.data?.options?.theme === "light" || event.data?.options?.theme === "dark") {
+        setTheme(event.data.options.theme);
+        toggleDarkMode(event.data.options.theme === "dark");
+      }
+    } catch (error) {
+      console.error(error);
+      toast.error("Invalid JSON!");
+    }
+  };
+
+  window.addEventListener("message", handler);
+  return () => window.removeEventListener("message", handler);
+}, [setColorScheme, setContents, setDirection, toggleDarkMode, theme]);
+```
+
+**内容下发链路**:
+```
+父窗口 postMessage({ json, options })
+    ↓
+Widget message 事件触发
+    ↓
+┌─ handler 函数 ─────────────────────────────┐
+│  1. 校验 event.data.json 存在               │
+│  2. 调用 useFile.setContents()             │
+│     ├─ 更新内存状态 contents                │
+│     ├─ hasChanges 设为 false（不持久化）    │
+│     └─ 防抖调用 useJson.setJson()           │
+│  3. 调用 useGraph.setDirection()            │
+│  4. 主题更新（见下文）                      │
+└─────────────────────────────────────────────┘
+    ↓
+GraphView 重新渲染
+```
+
+**关键点**: 
+- 父页面下发的内容 `hasChanges` 被强制设为 `false`，**不会写入 sessionStorage**
+- Widget 模式下禁用了 sessionStorage 恢复，确保内容完全由父页面控制
+
+### 4.5 主题下发的完整链路
+
+主题下发涉及**三层状态同步**，是最复杂的部分：
+
+#### 4.5.1 三层主题状态
+
+| 层级 | 状态 | 存储位置 | 管理方 |
+|------|------|---------|-------|
+| 1 | `theme` (local state) | 内存 | Widget 组件 useState |
+| 2 | `darkmodeEnabled` | localStorage "config" | useConfig (Zustand) |
+| 3 | `colorScheme` | localStorage "editor-color-scheme" | Mantine 管理器 |
+
+#### 4.5.2 主题下发完整流程
+
+```
+父窗口 postMessage({ options: { theme: "dark" } })
+    ↓
+Widget message 事件触发
+    ↓
+┌─ handler 函数 ─────────────────────────────────┐
+│  1. setTheme("dark")                            │
+│     └─ 更新本地 useState → 触发 useEffect       │
+│  2. toggleDarkMode(true)                        │
+│     └─ useConfig 更新                           │
+│        ├─ 更新内存 darkmodeEnabled = true       │
+│        └─ Zustand persist 写入 localStorage    │
+│           key: "config"                         │
+└─────────────────────────────────────────────────┘
+    ↓
+useEffect 触发（theme 依赖）
+    ↓
+┌─ [widget.tsx L77-L79] ───────────────────────┐
+│  setColorScheme(theme)                        │
+│  └─ smartColorSchemeManager.set("dark")       │
+│     ├─ 更新内存 currentColorScheme = "dark"   │
+│     └─ 写入 localStorage                      │
+│        key: "editor-color-scheme"             │
+└───────────────────────────────────────────────┘
+    ↓
+MantineProvider 主题更新
+    ↓
+ThemeProvider (styled-components) 主题更新
+    ↓
+UI 重新渲染
+```
+
+**代码实现**:
+
+```typescript
+// 步骤1: message handler 中更新
+if (event.data?.options?.theme === "light" || event.data?.options?.theme === "dark") {
+  setTheme(event.data.options.theme);              // 更新本地 state
+  toggleDarkMode(event.data.options.theme === "dark");  // 更新 useConfig
+}
+
+// 步骤2: useEffect 同步到 Mantine
+React.useEffect(() => {
+  setColorScheme(theme);
+}, [setColorScheme, theme]);
+
+// 步骤3: ThemeProvider 消费
+<ThemeProvider theme={theme === "dark" ? darkTheme : lightTheme}>
+```
+
+#### 4.5.3 主题同步的潜在问题
+
+1. **三层状态可能不一致**:
+   - 如果 `setColorScheme` 失败，本地 `theme` state 和 `darkmodeEnabled` 已更新，但 Mantine 主题未变
+   - 如果 Widget 在非动态路径（虽然实际只在 /widget 和 /editor 下运行），`setColorScheme` 会静默失败
+
+2. **localStorage 写入但无反向同步**:
+   - `toggleDarkMode` 会写入 localStorage "config"
+   - `setColorScheme` 会写入 localStorage "editor-color-scheme"
+   - 但父页面无法感知这些变化（postMessage 是单向的）
+
+3. **内存缓存导致的过期值**:
+   - `smartColorSchemeManager` 的 `currentColorScheme` 内存缓存
+   - 如果其他代码直接修改 localStorage，Mantine 不会感知
+   - 必须通过 `setColorScheme` API 更新才能保证一致性
 
 ---
 
@@ -363,6 +601,7 @@ useConfig.toggleDarkMode(value)
 
 - [editor.tsx](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/editor.tsx) - 编辑器页面
 - [widget.tsx](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/widget.tsx) - Widget 嵌入页面
+- [docs.tsx](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/docs.tsx) - 嵌入文档（含 postMessage 示例）
 - [_app.tsx](file:///d:/fz/0601/solo-dogfeeding/code/190-jsoncrack.com/apps/www/src/pages/_app.tsx) - 应用根组件
 
 ### 6.4 UI 组件
@@ -390,5 +629,17 @@ useConfig.toggleDarkMode(value)
 1. **分层持久化**: 用户偏好使用 localStorage（长期保存），编辑内容使用 sessionStorage（会话级）
 2. **条件持久化**: 文件内容仅在满足大小限制、非 iframe、非 URL 加载等条件下才持久化
 3. **双重主题管理**: Zustand store 和 Mantine 管理器两套主题系统，需手动同步
-4. **无跨标签页同步**: 依赖浏览器原生存储特性，不主动实现多标签页状态同步
+4. **无跨标签页实时同步**: 依赖浏览器原生存储特性，不主动实现多标签页状态同步
 5. **Widget 特殊处理**: 嵌入模式下禁用 sessionStorage 恢复，通过 postMessage 与父窗口通信
+6. **postMessage 单向通信**: Widget 与父页面的通信是单向的（父→子），仅在初始化时子→父发送 ready 信号
+7. **三层主题同步**: Widget 模式下主题需要同步本地 state、useConfig store 和 Mantine 管理器三层状态
+8. **会话隔离设计**: sessionStorage 的天然隔离特性确保了多标签页编辑内容互不干扰
+
+### 7.3 跨页面同步边界总结
+
+| 场景 | 同步机制 | 实时性 | 说明 |
+|------|---------|--------|------|
+| 多标签页 Editor | 无 | ❌ | localStorage 隐式共享但不同步，sessionStorage 完全隔离 |
+| Widget ↔ 父页面 | postMessage | ✅ | 父→子单向实时同步，子→父仅初始化时发送 ready 信号 |
+| 多标签页 Widget | 无 | ❌ | 每个 iframe 独立，完全由各自父页面控制 |
+| Editor ↔ Widget | 无 | ❌ | 即使同源打开，也无任何同步机制 |
