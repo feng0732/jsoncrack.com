@@ -473,13 +473,15 @@ panel.onDidDispose(disposer, null, context.subscriptions);
 
 ### 5.4 Chrome 扩展
 
-#### 5.4.1 Worker 禁用：CSP 回退
+#### 5.4.1 问题背景：为什么要禁用 Worker
 
-Chrome 扩展的内容脚本（Content Script）注入到第三方页面中，这些页面可能有严格的 CSP（如 `default-src 'none'`），导致 Worker 创建失败。
+Chrome 扩展的内容脚本（Content Script）注入到第三方 JSON 页面中运行。许多 JSON 查看页面带有严格的 CSP（如 GitHub Raw 的 `default-src 'none'`），如果布局引擎尝试创建 Web Worker，会因 CSP 拦截而抛错导致渲染失败。
 
-项目采用**两层防护机制**确保 ELK 回退到同步布局模式。
+因此项目设计了**两层 Worker 禁用机制**，强制 ELK 回退到同步布局路径。
 
-##### 第一层：构建时 Banner 注入
+---
+
+#### 5.4.2 第一层：构建时 Banner 注入（IIFE 作用域遮蔽）
 
 **代码位置**：[vite.config.ts](file:///d:/fz/0601/solo-dogfeeding/code/184-jsoncrack.com/apps/chrome-extension/vite.config.ts#L23-L28)
 
@@ -492,12 +494,25 @@ rollupOptions: {
 },
 ```
 
-**作用**：
-- 在 IIFE 打包产物的函数体开头注入 `var Worker = undefined;`
-- 由于 `var` 声明在函数作用域内，它会**遮蔽**（shadow）全局的 `Worker` 构造函数
-- 整个 content script 代码执行期间，直接引用 `Worker` 都会得到 `undefined`
+**构建产物结构**：
+```javascript
+// vite 打包为 IIFE 格式，banner 被注入函数体最开头
+(function() {
+  var Worker = undefined;  // ← banner 注入，IIFE 函数作用域内的局部变量
+  var process = ...;
+  // ... content-script.tsx 的所有代码 ...
+})();
+```
 
-##### 第二层：运行时全局禁用
+**作用域分析**：
+- `var Worker = undefined` 声明在 **IIFE 函数作用域** 内
+- 它只遮蔽 content script **自身代码** 中直接出现的 `Worker` 标识符
+- 对于**动态导入**的模块（`jsoncrack-react`、`reaflow`、`elkjs`）无效——这些模块运行在自己的模块作用域，查找 `Worker` 时走全局作用域链，不会经过 IIFE 的局部变量
+- 因此这一层是**兜底**，真正决定分支的是第二层
+
+---
+
+#### 5.4.3 第二层：运行时全局禁用（决定实际分支的关键）
 
 **代码位置**：[content-script.tsx](file:///d:/fz/0601/solo-dogfeeding/code/184-jsoncrack.com/apps/chrome-extension/src/content-script.tsx#L28-L50)
 
@@ -508,17 +523,15 @@ const loadJsonCrackComponent = async (): Promise<JSONCrackComponentType> => {
   }
 
   jsonCrackComponentPromise = (async () => {
-    // ELK (the layout engine used by reaflow) tries to spawn a Web Worker
-    // on first use. On JSON pages with a strict `default-src 'none'` CSP,
-    // worker creation throws. Temporarily shadow `Worker` for the duration
-    // of the import + initial layout so ELK falls back to its sync path,
-    // then restore it so the host page's own workers keep working.
+    // 保存原始全局 Worker
     const originalWorker = (globalThis as { Worker?: typeof Worker }).Worker;
     try {
+      // 关键：将全局 Worker 置为 undefined
       (globalThis as { Worker?: typeof Worker }).Worker = undefined;
-      const mod = await import("jsoncrack-react");
+      const mod = await import("jsoncrack-react");  // 动态导入期间 Worker 被禁用
       return mod.JSONCrack as JSONCrackComponentType;
     } finally {
+      // 导入完成后立即恢复全局 Worker，避免影响宿主页面
       (globalThis as { Worker?: typeof Worker }).Worker = originalWorker;
     }
   })();
@@ -527,84 +540,172 @@ const loadJsonCrackComponent = async (): Promise<JSONCrackComponentType> => {
 };
 ```
 
-**关键逻辑**：
-1. **保存**：保存原始的 `globalThis.Worker`
-2. **禁用**：将 `globalThis.Worker` 设为 `undefined`
-3. **导入**：动态导入 `jsoncrack-react` 模块
-4. **恢复**：在 `finally` 块中恢复 `globalThis.Worker`
+---
 
-#### 5.4.2 为什么两层防护都需要？
+#### 5.4.4 实际分支选择：isBrowser 判断精确时机与结果
 
-| 层级 | 作用域 | 影响范围 | 目的 |
-|------|--------|---------|------|
-| Banner `var Worker = undefined` | IIFE 函数作用域 | content script 自身代码 | 遮蔽直接的 `Worker` 引用 |
-| `globalThis.Worker = undefined` | 全局作用域 | 动态导入的模块 | 确保导入的模块也看不到 Worker |
+**reaflow 中的分支判断代码**（[elkLayout.ts](file:///d:/fz/0601/solo-dogfeeding/code/184-jsoncrack.com/node_modules/reaflow/src/layout/elkLayout.ts) 顶层作用域）：
 
-动态导入的模块运行在自己的模块作用域中，它们访问 `Worker` 时会查找全局作用域，因此需要修改 `globalThis.Worker`。
+```typescript
+// 模块顶层作用域，模块加载时立即求值
+const isBrowser = typeof window !== 'undefined' && typeof Worker !== 'undefined';
+```
 
-#### 5.4.3 禁用时机与恢复边界
+**精确时间轴与求值结果**：
 
 ```
 时间轴 →
   │
   ├─ content script 开始执行
-  │   (banner: var Worker = undefined)
+  │   (banner 注入 var Worker = undefined 在 IIFE 作用域)
   │
-  ├─ loadJsonCrackComponent() 调用
-  │   │
-  │   ├─ 保存 originalWorker
-  │   ├─ globalThis.Worker = undefined  ──┐
-  │   │                                    │ 禁用期
-  │   ├─ await import("jsoncrack-react")  │
-  │   │    (ELK 模块初始化)                │
-  │   │    (检测到 Worker 不可用)           │
-  │   │    (决定使用同步模式)              │
-  │   │                                    │
-  │   └─ globalThis.Worker = originalWorker ──┘
-  │       (恢复全局 Worker)
+  ├─ 用户首次点击 "Graph" 按钮
+  │   └─ GraphView 组件挂载 → useEffect 调用 loadJsonCrackComponent()
+  │       │
+  │       ├─ 保存 originalWorker = window.Worker （真实的 Worker 构造函数）
+  │       ├─ globalThis.Worker = undefined   ──┐
+  │       │                                      │ 【禁用窗口】
+  │       ├─ await import("jsoncrack-react")    │
+  │       │   → 递归导入 reaflow                │
+  │       │     → 递归导入 elkjs 相关模块        │
+  │       │       → elkLayout.ts 模块加载        │
+  │       │         → 顶层 isBrowser 立即求值     │
+  │       │             typeof window → 'object' ✅
+  │       │             typeof Worker → 'undefined' ❌  ← 关键！此时全局 Worker 被遮蔽
+  │       │             isBrowser = false        │
+  │       │         → getElk() 走同步分支       │
+  │       │             import('elkjs/lib/elk.bundled.js')
+  │       │                                      │
+  │       └─ globalThis.Worker = originalWorker ──┘ （导入完成，恢复全局 Worker）
+  │           （此时 isBrowser 早已求值完毕，恢复 Worker 不影响已固化的模式）
   │
-  ├─ 用户点击 Graph 按钮
-  │   └─ 组件挂载 → 首次布局（同步模式）
+  ├─ 首次布局
+  │   └─ getElk() 返回同步 ELK 实例（elk.bundled.js）
+  │       layout() 在主线程同步计算
   │
-  ├─ 后续布局计算
-  │   └─ 始终使用同步模式（ELK 已确定模式）
+  ├─ 用户切换 Raw → Graph
+  │   └─ elkInstance 已存在，直接复用同步实例
   │
   ▼
 ```
 
-**关键点**：
-- **禁用窗口**：只在 `import` 执行期间禁用全局 Worker
-- **模式固化**：ELK 在模块初始化时检测 Worker 可用性，一旦决定使用同步模式，后续即使恢复了 `globalThis.Worker` 也不会再尝试创建 Worker
-- **宿主页面不受影响**：恢复 `globalThis.Worker` 确保宿主页面的其他 Worker 正常工作
+**最终分支选择结果**：
 
-#### 5.4.4 同步模式的表现
+| 分支条件 | 值 | 原因 |
+|---------|----|------|
+| `typeof window` | `'object'` | 始终为 true，content script 运行在页面上下文中 |
+| `typeof Worker` | `'undefined'` | 在禁用窗口内读取全局作用域，`globalThis.Worker` 被置为 `undefined` |
+| `isBrowser` | `false` | 两个条件需同时满足，Worker 不满足 |
+| **实际分支** | **`elkjs/lib/elk.bundled.js`（同步模式）** | 不走 Worker 路径 |
 
-- 布局计算在**主线程**执行
-- 大型 JSON 文件可能会短暂阻塞 UI
-- 功能完整，所有布局特性都支持
-- 加载状态管理逻辑不变
+---
 
-#### 5.4.5 组件卸载与资源清理
+#### 5.4.5 elk.bundled.js 同步模式的真实行为
+
+`elk.bundled.js` 与 `elk-api.js` 的区别：
+
+| 特性 | `elk.bundled.js`（同步分支） | `elk-api.js`（Worker 分支） |
+|------|---------------------------|------------------------|
+| Worker | 不使用，算法直接嵌入主线程 | 通过 `workerFactory` 创建 Worker |
+| layout() 返回类型 | Promise（但同步完成后立即 resolve） | Promise（Worker 计算完成后 resolve） |
+| 布局计算位置 | **主线程**，阻塞 UI | Worker 线程，不阻塞 UI |
+| 初始化体积 | GWT 编译的完整算法代码，较大 | 只是 API 包装，算法在 Worker 脚本中 |
+
+**注意**：即使是同步模式，`elk.layout()` 的返回类型仍为 Promise——这是为了与 Worker 模式保持 API 兼容。布局计算在 `.then()` 回调前已经同步完成，但仍通过微任务队列 resolve Promise。
+
+---
+
+#### 5.4.6 两层防护的作用域对比
+
+| 层级 | 代码 | 作用域 | 影响范围 | 是否决定分支 |
+|------|------|--------|---------|------------|
+| 构建时 banner | `var Worker = undefined` | IIFE 函数作用域 | content script 自身代码中直接的 `Worker` 引用 | ❌ 不是，动态导入模块不受影响 |
+| 运行时全局 | `globalThis.Worker = undefined` | 全局作用域（隔离世界） | 动态导入的所有模块（jsoncrack-react、reaflow、elkjs） | ✅ **是**，决定 isBrowser = false |
+
+**为什么两层都需要？**
+- 第一层 banner 是**兜底防御**：防止 content script 自身代码某处直接写了 `new Worker()`
+- 第二层全局禁用是**核心机制**：确保动态导入的依赖模块在初始化时检测不到 Worker
+
+---
+
+#### 5.4.7 模式固化：恢复 Worker 不会影响已确定的分支
+
+`isBrowser` 是在 `elkLayout.ts` 模块顶层的 `const` 常量，**模块加载时求值一次，之后永不改变**。即使 `finally` 块立即恢复了 `globalThis.Worker`，后续所有布局调用仍然使用已确定的同步模式。
+
+这是设计有意为之：
+1. 导入完成后尽快恢复全局 Worker，避免干扰宿主页面的 Worker
+2. ELK 模式只需在模块加载时确定一次，后续无需重新判断
+
+---
+
+#### 5.4.8 同步 ELK 单例的保留与释放
+
+##### 单例变量位置
+
+```typescript
+// elkLayout.ts 模块作用域
+let elkInstance: ELK | null = null;  // 同步模式下存储的是 elk.bundled.js 实例
+```
+
+Content script 运行在 Chrome 的**隔离世界（Isolated World）**中，拥有独立的 JS 执行上下文（独立的全局对象、独立的模块注册表），与宿主页面的 JS 上下文隔离。
+
+---
+
+##### 组件卸载（切换 Raw 模式）
 
 **代码位置**：[content-script.tsx](file:///d:/fz/0601/solo-dogfeeding/code/184-jsoncrack.com/apps/chrome-extension/src/content-script.tsx#L149-L154)
 
 ```typescript
 const unmountGraphView = () => {
   if (!graphRoot) return;
-  graphRoot.unmount();
+  graphRoot.unmount();      // React 卸载组件树
   graphRoot = null;
   reactRootContainer.textContent = "";
 };
 ```
 
-当用户切换回 "Raw" 模式时：
-1. React 组件卸载
-2. `Canvas` 组件卸载 → `useLayout` 清理函数执行 `promise.cancel()`（如果有布局任务在进行）
-3. **`elkInstance` 变量仍保留在模块作用域**（作为单例，除非宿主页面刷新或 content script 重新注入，否则不会重置）
-4. DOM 容器清空
-5. 同步 ELK 实例中的算法对象理论上可以被 GC，但实际上 `elkInstance` 引用仍存在，直到页面刷新才真正释放
+**切换 Raw 模式时发生什么**：
 
-（由于 Worker 被禁用，不存在 Worker 创建/销毁的问题，但同步 ELK 实例同样是模块级单例，不会随组件卸载而清除）
+| 步骤 | 对象 | 是否被清理 | 说明 |
+|------|------|----------|------|
+| 1 | React 组件树 | ✅ 是 | `graphRoot.unmount()` 卸载 `<GraphView>` → `<JSONCrack>` → `<Canvas>` |
+| 2 | useLayout 的 Promise | ✅ 是 | useEffect 清理函数执行 `promise.cancel()` |
+| 3 | **`elkInstance` 单例变量** | ❌ **否** | 它属于 `elkLayout.ts` 模块作用域，模块仍在内存中 |
+| 4 | 同步 ELK 实例内部的算法对象 | ❌ 否 | 被 `elkInstance` 引用，GC 不会回收 |
+| 5 | DOM 容器 | ✅ 是 | `textContent = ""` 清空 |
+| 6 | `jsonCrackComponentPromise` | ❌ **否** | content script 模块级变量，保留已加载的组件 |
+
+**关键结论**：组件卸载只是卸载 React UI，**不会**释放同步 ELK 单例。用户可以在 Raw / Graph 之间反复切换，每次重新挂载时都会复用已有的 `elkInstance`，无需重新初始化 ELK 引擎。
+
+---
+
+##### 单例真正释放的时机
+
+**只有以下情况会释放同步 ELK 单例**：
+
+| 触发场景 | 发生了什么 | elkInstance 是否释放 |
+|---------|----------|-------------------|
+| **宿主页面刷新**（F5） | 页面重新加载，content script 被 Chrome 重新注入到新的隔离世界中，模块重新执行 | ✅ 是（旧隔离世界销毁） |
+| **宿主页面导航**（点击链接跳转） | 同上，新页面的 content script 是全新的隔离世界 | ✅ 是（旧隔离世界销毁） |
+| **Chrome 扩展被禁用/重新启用** | content script 上下文被销毁并重建 | ✅ 是 |
+| **仅关闭 Graph 视图（切回 Raw）** | React 卸载，但 content script 仍在页面中运行 | ❌ 否 |
+| **切换标签页再切回来** | content script 不受影响 | ❌ 否 |
+
+---
+
+##### jsonCrackComponentPromise 的保留策略
+
+与 `elkInstance` 类似，`jsonCrackComponentPromise` 也是 content script 模块级变量：
+
+```typescript
+// content-script.tsx 顶层
+let jsonCrackComponentPromise: Promise<JSONCrackComponentType> | null = null;
+```
+
+这意味着：
+- 首次加载时动态 import 的 `jsoncrack-react` 模块会被缓存
+- 切换 Raw → Graph 多次，不会重复执行动态 import，也不会重新创建 ELK 实例
+- 整个单例链条（`jsonCrackComponentPromise` → `jsoncrack-react` 模块 → `reaflow` 模块 → `elkInstance`）在隔离世界生命周期内持续存在
 
 ---
 
@@ -736,16 +837,23 @@ const debouncedUpdateJson = debounce((value: unknown) => {
    - VS Code：`webview.postMessage` 用于扩展主机 ↔ webview 通信
    - 两者内部都各自运行着 ELK 布局 Worker
 
-7. **Chrome 扩展采用两层防护**禁用 Worker：
-   - 构建时 banner 注入：`var Worker = undefined` 作用于 IIFE 作用域
-   - 运行时全局禁用：`globalThis.Worker = undefined` 作用于动态导入模块
-   - 触发时机：`isBrowser = typeof Worker !== 'undefined'` 判断失败 → 走 `elk.bundled.js` 同步路径
-   - 导入完成后立即恢复全局 Worker，不影响宿主页面
+7. **Chrome 扩展两层禁用机制的精确分工**：
+   - **第一层（构建时 banner）**：`var Worker = undefined` 在 IIFE 函数作用域内，只遮蔽 content script 自身代码的直接 `Worker` 引用 → **兜底，不决定实际分支**
+   - **第二层（运行时全局）**：`globalThis.Worker = undefined` 在隔离世界的全局作用域，动态导入的 `jsoncrack-react` → `reaflow` → `elkjs` 都从全局读取 `Worker` → **核心，决定 isBrowser = false**
+   - **判断时机**：`const isBrowser = typeof Worker !== 'undefined'` 在 `elkLayout.ts` 模块顶层，**import 执行期间立即求值**，此时正好处于禁用窗口
+   - **实际分支**：`import('elkjs/lib/elk.bundled.js')`，同步模式，算法在主线程执行
+   - **模式固化**：`isBrowser` 是 `const`，求值一次后永不改变；`finally` 恢复全局 Worker 不影响已确定的同步模式
 
-8. **Worker 生命周期（修正后）**：
+8. **Chrome 扩展同步 ELK 单例的保留与释放**：
+   - `elkInstance` 变量位于 `elkLayout.ts` 模块作用域，属于 content script 的隔离世界（Isolated World）
+   - **切换 Raw/Graph（组件卸载/挂载）**：只 React unmount，`elkInstance` **不释放**，反复切换都复用同一实例
+   - **真正释放时机**：只有宿主页面**刷新**（F5）、**导航跳转**、或扩展被**禁用/重新启用**，导致 content script 的隔离世界被销毁并重建时，模块才重新执行，单例才释放
+   - `jsonCrackComponentPromise` 同理，也是 content script 模块级变量，在隔离世界生命周期内持续缓存
+
+9. **Worker 生命周期（修正后）**：
    - ✅ **创建**：首次调用 `elkLayout()` 时通过 `getElk()` 懒加载创建
    - ✅ **复用**：模块级单例，所有布局任务都发往同一个 Worker
    - ✅ **空闲**：布局完成后持续存活，等待新的 `postMessage`
-   - ❌ **组件卸载**：只 `promise.cancel()`，Worker **不终止**
+   - ❌ **组件卸载**：只 `promise.cancel()`，Worker **不终止**，同步 ELK 实例也**不释放**
    - ✅ **销毁**：页面关闭 / 上下文销毁（不是显式 terminate）
    - 项目代码 + reaflow 源码中 **均无** 显式 `worker.terminate()` 调用
