@@ -183,17 +183,21 @@ next build
 
 ## 4. `prefetch={false}` 的视口预取与 hover 行为
 
-### 4.1 Pages Router 中 Link 预取的两种机制
+### 4.1 Pages Router 中 Link 预取的确切语义
 
-Next.js Pages Router 的 `next/link` 预取有两个触发时机：
+Next.js Pages Router 的 `next/link` 预取有两个触发时机。**`prefetch={false}` 并不完全禁止预取**：
 
-| 触发时机 | 默认 `prefetch={true}` | `prefetch={false}` |
-|---|---|---|
-| **视口预取**（IntersectionObserver） | 链接进入视口时预取 | ❌ 不预取 |
-| **鼠标 hover** | hover 时再次确认/加强预取 | ❌ 不预取 |
-| **用户点击时** | 已预取，几乎无延迟 | 点击时才开始加载 JS chunk |
+| 触发时机 | `prefetch={true}`（默认） | `prefetch={false}` | 完全禁止预取的方式 |
+|---|---|---|---|
+| **视口预取**（IntersectionObserver） | ✅ 链接进入视口时预取 | ❌ 不预取 | 同左 |
+| **鼠标 hover** | ✅ hover 时预取 | ⚠️ **仍会预取** | 必须使用普通 `<a>` 标签 |
+| **用户点击时** | 已预取，几乎无延迟 | hover 过则已预取；否则按需加载 | 同左 |
 
-> **注意**：Pages Router 中 `prefetch` 的默认值在**生产环境**为 `true`，在开发环境为 `false`。静态导出后走生产构建，默认值为 `true`。
+> **Pages Router vs App Router 的关键区别**：
+> - **Pages Router**（本项目）：`prefetch={false}` 只关闭视口预取，hover 预取仍然生效。Next.js 官方文档原文：*"Prefetching will not happen when entering the viewport, but will happen on hover. If you want to completely remove fetching on hover as well, consider using an `<a>` tag."*
+> - **App Router**：`prefetch={false}` 同时关闭视口预取和 hover 预取。如果要在 App Router 中实现"仅 hover 预取"，需手动用 `router.prefetch()` 在 `onMouseEnter` 中触发。
+>
+> 参见：https://nextjs.org/docs/pages/api-reference/components/link
 
 ### 4.2 项目中所有 `next/link` 的使用盘点
 
@@ -214,39 +218,56 @@ Next.js Pages Router 的 `next/link` 预取有两个触发时机：
 - 404 页的返回首页链接**没有**设置 `prefetch`，使用默认值 `true` → 视口进入时会预取首页 JS
 - 外部链接的 `prefetch` 属性无意义（Next.js 不会预取外部域）
 
-### 4.3 `prefetch={false}` 下的完整跳转流程（静态导出场景）
+### 4.3 `prefetch={false}` 下的跳转流程（静态导出 + Pages Router）
 
 ```
 用户浏览页面，页面上有一个 <Link href="/editor" prefetch={false}>
   │
   ├─ 链接进入视口
-  │    └─ ❌ 不触发预取
+  │    └─ ❌ 不触发预取（视口预取被 prefetch={false} 禁用）
   │
   ├─ 用户鼠标 hover 到链接上
-  │    └─ ❌ 不触发预取
+  │    └─ ⚠️ 仍然触发预取！加载 /editor 页面的 JS chunk
+  │         （Pages Router 的 prefetch={false} 不禁用 hover 预取）
   │
   ├─ 用户点击链接
   │    │
-  │    ├─ ① Next.js router 捕获 click 事件
-  │    ├─ ② 发起 fetch 请求加载 /editor 页面的 JS chunk
-  │    │     （静态导出下：fetch /_next/static/chunks/pages/editor.[hash].js）
+  │    ├─ 情况 A：之前 hover 过 → JS chunk 已缓存
+  │    │    ├─ ① Next.js router 捕获 click 事件
+  │    │    ├─ ② 直接从缓存读取 JS chunk
+  │    │    ├─ ③ React 卸载当前页面组件、挂载 /editor 页面组件
+  │    │    ├─ ④ history.pushState 更新 URL
+  │    │    ├─ ⑤ _app pathname 变化 → 重新渲染 → 颜色方案重新计算
+  │    │    └─ ⑥ /editor 页面 useEffect 执行 → 读取 query → 加载数据
   │    │
-  │    ├─ ③ JS chunk 下载完成
-  │    ├─ ④ React 卸载当前页面组件
-  │    ├─ ⑤ React 挂载 /editor 页面组件
-  │    ├─ ⑥ history.pushState 更新 URL（不触发整页刷新）
-  │    ├─ ⑦ _app pathname 变化 → 重新渲染 → 颜色方案重新计算
-  │    └─ ⑧ /editor 页面 useEffect 执行 → 读取 query → 加载数据
+  │    └─ 情况 B：没有 hover 过（键盘导航等）→ 按需加载
+  │         ├─ ① Next.js router 捕获 click 事件
+  │         ├─ ② 发起 fetch 请求加载 /editor 页面的 JS chunk
+  │         ├─ ③ JS chunk 下载完成
+  │         ├─ ④ React 卸载当前页面组件、挂载 /editor 页面组件
+  │         ├─ ⑤ history.pushState 更新 URL
+  │         └─ ⑥ /editor 页面 useEffect 执行
   │
   └─ 用户看到新页面内容
 ```
 
-### 4.4 为什么项目中主站链接全部关闭预取
+### 4.4 如何完全禁止预取：普通 `<a>` 与 `<Link>` 的本质区别
 
-可能的原因（从代码推断）：
-1. **减少带宽**：静态导出后每个页面都有独立 JS chunk，全部预取会浪费流量
-2. **编辑器页面体积大**：`/editor` 包含 Monaco Editor + JSONCrack 图形库，chunk 体积大，预取代价高
-3. **营销站流量少**：首页 → 编辑器是主要跳转路径，用户点击意向明确时才加载
+在 Pages Router 中，`<Link prefetch={false}>` **不能**完全禁止预取。要实现零预取，必须使用普通 `<a>` 标签。
+
+| 特性 | `<Link prefetch={false}>` | 普通 `<a href>` |
+|---|---|---|
+| 视口预取 | ❌ 禁用 | ❌ 无（原生 a 不参与 Next.js 预取） |
+| hover 预取 | ⚠️ **仍会触发** | ❌ 无 |
+| 跳转方式 | SPA 客户端路由 | 整页导航（浏览器原生行为） |
+| `_app` 保留 | ✅ 是 | ❌ 否（全量重建） |
+| Store 状态 | ✅ 保留 | ❌ 丢失 |
+| JS chunk 加载时机 | hover 时或点击时 | 整页加载时（HTML + 全部 JS） |
+
+**本项目中的对应**：
+- `<Link prefetch={false}>` 用在 Navbar "Embed"、Footer 各链接、Logo → **hover 时仍会预取目标页面 JS**
+- 普通 `<a href="/editor">` 用在 Navbar "Editor" 按钮、HeroSection "Go to Editor" → **完全零预取，但代价是整页刷新**
+- 这是性能与体验的权衡：营销页链接保留 SPA 体验（hover 预取兜底），编辑器入口选择干净加载（零预取 + 整页刷新）
 
 ---
 
@@ -272,7 +293,7 @@ Next.js Pages Router 的 `next/link` 预取有两个触发时机：
 |---|---|---|---|
 | **路由来源** | pages 目录下有对应文件，明确路由 | 匹配不到任何路由时兜底 | 运行时出错时触发 |
 | **SEO 配置** | 正常 index | `noindex: true`（`404.tsx:L12`） | 正常 index |
-| **页面内跳转方式** | 多用 `<Link prefetch={false}>` | `<Link href="/">`（无 prefetch，默认 true）（`404.tsx:L22`） | `router.reload()` 整页刷新（`_error.tsx:L29`） |
+| **页面内跳转方式** | 多用 `<Link prefetch={false}>`（hover 仍预取） | `<Link href="/">`（默认 prefetch=true，视口 + hover 均预取）（`404.tsx:L22`） | `router.reload()` 整页刷新（`_error.tsx:L29`） |
 | **构建时是否生成单文件** | 是 | 是（`404.html`） | 是（但主要用于开发/SSR 错误） |
 | **是否保留当前路径** | 是（路径与页面一一对应） | 是（浏览器地址栏保持错误的 URL，页面显示 404 内容） | 是（地址栏不变，内容显示错误） |
 
@@ -306,9 +327,9 @@ Next.js Pages Router 的 `next/link` 预取有两个触发时机：
 
 | 方式 | 典型代码位置 | 视口预取 | hover 预取 | 整页刷新 | `_app` 保留 | 客户端接管 | 浏览器历史 | 场景 |
 |---|---|---|---|---|---|---|---|---|
-| **`<Link prefetch={false}>`** | Navbar "Embed"、Footer 各链接、Logo | ❌ 否 | ❌ 否 | ❌ 否 | ✅ 是 | ✅ 是（SPA 方式） | pushState | 主站内跳转（6 处） |
+| **`<Link prefetch={false}>`** | Navbar "Embed"、Footer 各链接、Logo | ❌ 否 | ⚠️ **是** | ❌ 否 | ✅ 是 | ✅ 是（SPA 方式） | pushState | 主站内跳转（6 处） |
 | **`<Link>`（默认 prefetch=true）** | 404 页"Go Home"按钮 | ✅ 是 | ✅ 是 | ❌ 否 | ✅ 是 | ✅ 是（SPA 方式） | pushState | 错误页返回首页（1 处） |
-| **普通 `<a href>` 站内** | Navbar "Editor" 按钮、HeroSection "Go to Editor" | ❌ 否（原生 a 标签无预取） | ❌ 否 | ✅ 是 | ❌ 否（全量加载） | ❌ 否（整个页面重新初始化） | 整页导航 | 编辑器入口（5 处） |
+| **普通 `<a href>` 站内** | Navbar "Editor" 按钮、HeroSection "Go to Editor" | ❌ 否 | ❌ 否 | ✅ 是 | ❌ 否（全量加载） | ❌ 否（整个页面重新初始化） | 整页导航 | 编辑器入口（5 处），**唯一真正零预取的站内导航** |
 | **普通 `<a href>` 站外** | Navbar "VS Code"、"Chrome"、"Open Source" 等 | ❌ 不适用 | ❌ 不适用 | 跳转至外部站点 | 不适用 | 不适用 | 整页跳转 | 外部链接（20+ 处） |
 | **`window.open(url, "_blank")`** | Logo 在 widget 页点击 | ❌ 否 | ❌ 否 | 新标签页 | 完全独立实例 | 全新实例 | 新标签页 | widget 页 Logo 点击（1 处） |
 | **`router.reload()`** | 500 页"Refresh"按钮 | ❌ 否 | ❌ 否 | ✅ 是（整页刷新） | ❌ 否（完全重建） | ❌ 否（重新来过） | replace 当前历史 | 错误恢复（1 处） |
@@ -331,9 +352,10 @@ Next.js Pages Router 的 `next/link` 预取有两个触发时机：
 ```
 
 可能原因（代码推断）：
-1. **编辑器与营销页是两套体验**：编辑器是重型应用，整页加载比 SPA 切换更干净
-2. **颜色方案差异**：营销页强制 light，编辑器跟随用户偏好。整页刷新可以避免主题切换动画
-3. **`_app` 内的 `pathname` 判断**：如果用 SPA 切换，`pathname` 变化会触发 `smartColorSchemeManager` 重新计算主题，可能产生闪烁
+1. **完全零预取**：`<Link prefetch={false}>` 在 Pages Router 中仍会在 hover 时预取，只有普通 `<a>` 才能真正禁止所有预取。编辑器页面 JS chunk 体积大（Monaco + JSONCrack），零预取可以避免用户无意间 hover 时触发大量资源下载
+2. **编辑器与营销页是两套体验**：编辑器是重型应用，整页加载比 SPA 切换更干净
+3. **颜色方案差异**：营销页强制 light，编辑器跟随用户偏好。整页刷新可以避免主题切换动画
+4. **`_app` 内的 `pathname` 判断**：如果用 SPA 切换，`pathname` 变化会触发 `smartColorSchemeManager` 重新计算主题，可能产生闪烁
 
 ---
 
@@ -589,14 +611,14 @@ useGraph store  (features/editor/views/GraphView/stores/useGraph.ts)
 
 ### 9.2 页面间跳转的边界（6 种方式对比）
 
-| 机制 | 整页刷新 | `_app` 卸载 | Store 状态保留 | 预取 | 典型位置 |
-|---|---|---|---|---|---|
-| `<Link prefetch={false}>` SPA | ❌ 否 | ❌ 否 | ✅ 是 | ❌ 否 | Navbar "Embed"、Footer |
-| `<Link>` 默认 prefetch SPA | ❌ 否 | ❌ 否 | ✅ 是 | ✅ 视口预取 | 404 页返回首页 |
-| `<a href>` 站内 | ✅ 是 | ✅ 是 | ❌ 否 | ❌ 否 | Navbar "Editor" 按钮 |
-| `<a href>` 站外 | 跳转外部 | 不适用 | 不适用 | 不适用 | VS Code、Chrome 等外链 |
-| `window.open` 新标签页 | 新标签页 | 全新实例 | 独立 | ❌ 否 | widget 页 Logo |
-| `router.reload()` | ✅ 是 | ✅ 是 | ❌ 否 | ❌ 否 | 500 错误页刷新按钮 |
+| 机制 | 整页刷新 | `_app` 卸载 | Store 状态保留 | 视口预取 | hover 预取 | 典型位置 |
+|---|---|---|---|---|---|---|
+| `<Link prefetch={false}>` SPA | ❌ 否 | ❌ 否 | ✅ 是 | ❌ 否 | ⚠️ **是** | Navbar "Embed"、Footer |
+| `<Link>` 默认 prefetch SPA | ❌ 否 | ❌ 否 | ✅ 是 | ✅ 是 | ✅ 是 | 404 页返回首页 |
+| `<a href>` 站内 | ✅ 是 | ✅ 是 | ❌ 否 | ❌ 否 | ❌ 否（零预取） | Navbar "Editor" 按钮 |
+| `<a href>` 站外 | 跳转外部 | 不适用 | 不适用 | 不适用 | 不适用 | VS Code、Chrome 等外链 |
+| `window.open` 新标签页 | 新标签页 | 全新实例 | 独立 | ❌ 否 | ❌ 否 | widget 页 Logo |
+| `router.reload()` | ✅ 是 | ✅ 是 | ❌ 否 | ❌ 否 | ❌ 否 | 500 错误页刷新按钮 |
 
 ### 9.3 查询参数驱动数据加载的边界
 
