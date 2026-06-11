@@ -209,9 +209,27 @@ return result;
 
 **YAML 解析边界**（`jsonAdapter.ts#L15-L18`）：
 
-- `js-yaml` 的 `load()` 支持 YAML 1.2 全集，包括多文档、锚点/别名、自定义标签等
-- 但输出到后续链路时只保留标准 JSON 兼容类型（string/number/boolean/null/object/array）
-- YAML 特有结构（如 `&anchor` / `*alias`）在解析阶段即被 `js-yaml` 展开为实际值，转回 YAML 时无法还原原始锚点语法
+**`load()` 与 `loadAll()` 的区别**（js-yaml API）：
+- `load(yaml)`：解析**单个** YAML 文档，返回单个对象。若输入包含 `---` 分隔的多文档，仅返回**第一个**文档，后续文档被忽略。
+- `loadAll(yaml, iterator?, options?)`：解析**所有** YAML 文档，通过迭代器回调或返回数组处理。
+- 当前代码使用 `load()`（`L17`），**不支持多文档 YAML**。
+
+```ts
+// jsonAdapter.ts L15-L18
+if (format === FileFormat.YAML) {
+  const { load } = await import("js-yaml");
+  return load(value) as object;    // 仅 load，非 loadAll
+}
+```
+
+**YAML 特性在 `YAML → 中间对象 → 导出` 过程中的丢失**：
+1. **多文档**：输入含 `---` 多文档时，`load()` 只保留第一个文档，其余全部丢弃——**不存在多文档支持**。
+2. **锚点 & 别名**（`&anchor` / `*alias`）：在 `load()` 解析阶段即被展开为实际值，中间对象中不保留锚点定义和引用关系。再经 `dump(parse(json))`（`jsonAdapter.ts#L57-L59`）导出时，只会输出普通值，无法还原原始锚点语法。
+3. **自定义标签**（如 `!MyTag`）：`load()` 按 `json` schema（默认）解析时，非标准标签会抛出异常；即使通过 schema 选项解析，中间对象里也不会保留标签信息，`dump()` 导出时无法还原。
+4. **注释**：YAML 注释在 `load()` 解析 AST 构建阶段即被丢弃，中间对象和 `dump()` 输出都不包含。
+5. **缩进风格、行宽、引号样式**：`dump()` 按 js-yaml 默认配置重新序列化，不保留原始 YAML 的排版风格。
+
+**YAML → JSON 中间对象的类型保留**：`js-yaml` 的 `load()` 会将 YAML 类型映射到 JS 原生类型（YAML `!!int` → JS `number`，`!!bool` → `boolean`，`!!null` → `null` 等），这些标准 JSON 类型能无损传递到后续链路；但 YAML 特有类型（`!!timestamp`、`!!binary`、自定义标签等）在默认 `json` schema 下会被转换或抛错，不能原样保留。
 
 **XML 解析边界**（`jsonAdapter.ts#L20-L31`）：
 
@@ -738,8 +756,12 @@ setFormat(newFormat)                    apps/www/src/store/useFile.ts#L86-L98
   │
   ├─ prevFormat = get().format
   ├─ set({ format: newFormat })
-  ├─ contentJson = contentToJson(contents, prevFormat)    ← 旧格式 → 中间 JSON 对象
-  └─ jsonContent = jsonToContent(JSON.stringify(contentJson, null, 2), newFormat)
+  │
+  ├─ ① 原格式 → 中间对象：contentToJson(contents, prevFormat)
+  │           （旧格式文本 → JS 对象）
+  │
+  └─ ② 中间对象 → 新格式：jsonToContent(JSON.stringify(contentJson, null, 2), newFormat)
+       │         （JS 对象序列化为 JSON 字符串 → 新格式文本）
        │
        ├─ "json" → JSON.stringify(JSON.parse(json), null, 2)
        ├─ "yaml" → js-yaml dump(parse(json))
@@ -749,16 +771,16 @@ setFormat(newFormat)                    apps/www/src/store/useFile.ts#L86-L98
   └─ setContents({ contents: jsonContent })  ← 新格式文本重新走解析链路
 ```
 
-**格式转换不是无损的**，各方向存在已知边界：
+**格式转换不是无损的**，各方向存在已知边界（实际转换路径为 **原格式文本 → 中间 JSON 对象 → 新格式文本**，而非 `JSON → 原格式 → JSON`）：
 
-| 转换方向 | 丢失/变形内容 | 原因 |
+| 转换方向（按实际数据流） | 丢失/变形内容 | 原因 |
 |---------|-------------|------|
-| JSON → YAML → JSON | YAML 原始注释、锚点/别名、自定义标签 | `js-yaml` 的 `dump()` 只按标准序列化输出，不还原 YAML 特有语法 |
-| JSON → XML → JSON | 文档顺序可能改变；命名空间前缀、CDATA 段丢失 | `XMLBuilder` 不保留原始 XML 元素顺序信息，命名空间和 CDATA 不在 `XMLParser` 的解析模型中 |
-| JSON → XML → JSON | 带 `$` 前缀的键被误识别为属性 | `attributeNamePrefix: "$"` 是双向约定，但用户在 JSON 侧手动添加的 `$key` 也会被当作属性 |
-| JSON → CSV → JSON | 嵌套结构被扁平化；非数组对象被包装为单行数组 | `expandArrayObjects: true` + `expandNestedObjects: true` 将深层键展开为点号列名，`csv2json` 还原后只有扁平对象 |
-| JSON → CSV → JSON | 数值/布尔值类型可能变为字符串 | CSV 本质上是文本格式，`wrapBooleans: true` 将布尔值写为 `"true"/"false"` 字符串 |
-| 任意格式 → JSON → 原格式 | 原始格式中的空白、缩进风格 | `jsonToContent` 总是重新序列化，不保留原始文本格式 |
+| **YAML → 中间对象 → YAML** | 注释、锚点/别名、自定义标签、多文档（仅保留第一个） | `load()` 解析为 JS 对象时，注释/锚点/标签/多文档信息已丢弃；`dump()` 只能按对象结构重新序列化 |
+| **XML → 中间对象 → XML** | 文档顺序可能改变；命名空间前缀、CDATA 段丢失 | `XMLBuilder` 不保留原始 XML 元素顺序信息，命名空间和 CDATA 不在 `XMLParser` 的解析模型中 |
+| **XML → 中间对象 → XML** | 带 `$` 前缀的键被误识别为属性 | `attributeNamePrefix: "$"` 是双向约定，但用户在 JSON 侧手动添加的 `$key` 也会被当作属性 |
+| **CSV → 中间对象 → CSV** | 嵌套结构被扁平化；非数组对象被包装为单行数组 | `expandArrayObjects: true` + `expandNestedObjects: true` 将深层键展开为点号列名，`csv2json` 还原后只有扁平对象 |
+| **CSV → 中间对象 → CSV** | 数值/布尔值类型可能变为字符串 | CSV 本质上是文本格式，`wrapBooleans: true` 将布尔值写为 `"true"/"false"` 字符串 |
+| **任意格式 → 中间对象 → 任意格式** | 原始格式中的空白、缩进风格、换行符 | `jsonToContent` 总是按目标格式默认配置重新序列化，不保留原始文本格式 |
 
 ---
 
