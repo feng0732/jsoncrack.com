@@ -823,6 +823,299 @@ return fetch(url)  // 直接使用用户输入，无任何校验
 
 ---
 
+## 十二、URL 导入 JSON 格式对 sessionStorage 保存与恢复的影响
+
+### 12.1 sessionStorage 保存的两个核心字段
+
+**位置**：[useFile.ts#L114-L117](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts#L114-L117)
+
+```typescript
+if (get().hasChanges && contents && contents.length < 80_000 && !isIframe() && !isFetchURL) {
+  sessionStorage.setItem("content", contents);   // 原始内容字符串
+  sessionStorage.setItem("format", get().format); // 格式标识
+  set({ hasChanges: true });
+}
+```
+
+sessionStorage 中保存的是**一对关联数据**：
+- `content`：编辑器原始内容（可以是 JSON/YAML/XML/CSV 任意格式的字符串）
+- `format`：内容对应的格式枚举值（`"json" | "yaml" | "xml" | "csv"`）
+
+---
+
+### 12.2 多格式（JSON/YAML/XML/CSV）对保存的影响
+
+#### URL 导入入口的格式默认值
+
+**位置**：[ImportModal/index.tsx#L25-L28](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/features/modals/ImportModal/index.tsx#L25-L28)
+
+```typescript
+return fetch(url)
+  .then(res => res.json())
+  .then(json => {
+    setContents({ contents: JSON.stringify(json, null, 2) });
+    // ⚠️ 注意：未显式指定 format 参数
+    onClose();
+  })
+```
+
+**关键发现**：通过 URL 导入（无论是地址参数入口还是 ImportModal 入口）加载远程 JSON 时，**`setContents` 未传入 `format` 参数**，因此 format 会使用 store 的**当前值**（默认为 `FileFormat.JSON`）。
+
+**位置**：[useFile.ts#L100-L107](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts#L100-L107)
+
+```typescript
+setContents: async ({ contents, hasChanges = true, skipUpdate = false, format }) => {
+  try {
+    set({
+      ...(contents && { contents }),
+      error: null,
+      hasChanges,
+      format: format ?? get().format,  // ← format 未指定时，使用当前值
+    });
+```
+
+#### 各格式在保存时的表现
+
+| 格式 | sessionStorage 存储内容（示例） | 字符串长度对比 | 80KB 限制影响 |
+|------|------------------------------|-------------|-------------|
+| **JSON** | `{"name": "test", "value": 123}` | 基准长度 | 标准限制 |
+| **YAML** | `name: test\nvalue: 123` | 比 JSON 短 ~15-30%（省略引号、括号） | 可存储更多有效数据 |
+| **XML** | `<root><name>test</name><value>123</value></root>` | 比 JSON 长 ~50-100%（标签冗余） | 更容易触发 80KB 限制 |
+| **CSV** | `name,value\ntest,123` | 比 JSON 短 ~40-60%（无键名重复） | 可存储最多数据 |
+
+**格式对保存的直接影响**：
+1. **XML 格式最容易触发 80KB 限制**：相同数据量，XML 字符串长度最长
+2. **CSV 格式最节省空间**：扁平化结构 + 无键名重复，相同数据量占用空间最小
+3. **URL 导入始终保存为 JSON 格式**：因为 `fetch().json()` → `JSON.stringify()` 产生的是 JSON 字符串，且 format 使用默认值 `"json"`
+
+---
+
+### 12.3 format 字段在恢复流程中的决定性作用
+
+#### 恢复时的 format 读取逻辑
+
+**位置**：[useFile.ts#L147-L153](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts#L147-L153)
+
+```typescript
+const sessionContent = sessionStorage.getItem("content") as string | null;
+const format = sessionStorage.getItem("format") as FileFormat | null;
+if (sessionContent && !widget) contents = sessionContent;
+
+if (format) set({ format });  // ← 先恢复 format
+get().setContents({ contents, hasChanges: false });
+```
+
+**恢复顺序至关重要**：
+1. **先设置 format**：`if (format) set({ format })`
+2. **再调用 setContents**：此时 `get().format` 已经是恢复后的正确值
+3. **contentToJson 使用恢复后的 format 解析**
+
+#### contentToJson 的格式分支解析
+
+**位置**：[jsonAdapter.ts#L4-L45](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/lib/utils/jsonAdapter.ts#L4-L45)
+
+```typescript
+export const contentToJson = async (value: string, format = FileFormat.JSON): Promise<object> => {
+  if (!value) return {};
+
+  if (format === FileFormat.JSON) {
+    const { parse } = await import("jsonc-parser");
+    // JSON 解析（支持注释和尾随逗号）
+  }
+
+  if (format === FileFormat.YAML) {
+    const { load } = await import("js-yaml");
+    // YAML 解析
+  }
+
+  if (format === FileFormat.XML) {
+    const { XMLParser } = await import("fast-xml-parser");
+    // XML 解析
+  }
+
+  if (format === FileFormat.CSV) {
+    const { csv2json } = await import("json-2-csv");
+    // CSV 解析
+  }
+
+  return {};
+};
+```
+
+> **⚠️ 关键结论**：如果 format 字段丢失或与 content 不匹配，**contentToJson 会使用错误的解析器**，导致解析失败或数据错误。
+
+#### format-content 不匹配的后果演示
+
+| sessionStorage 状态 | content 实际格式 | format 值 | 解析器选择 | 结果 |
+|-------------------|---------------|----------|----------|------|
+| 正常保存 | JSON | `"json"` | jsonc-parser | ✅ 解析成功 |
+| format 丢失 | JSON | `undefined`（默认 JSON） | jsonc-parser | ✅ 恰好成功（因默认是 JSON） |
+| format 丢失 | YAML | `undefined`（默认 JSON） | jsonc-parser | ❌ 解析失败，显示错误 |
+| format 丢失 | XML | `undefined`（默认 JSON） | jsonc-parser | ❌ 解析失败，显示错误 |
+| format 丢失 | CSV | `undefined`（默认 JSON） | jsonc-parser | ❌ 解析失败，显示错误 |
+| 格式不匹配 | YAML | `"xml"` | fast-xml-parser | ❌ 解析失败或产生错误结构 |
+
+---
+
+### 12.4 JSON 内容特征对保存与恢复的影响
+
+#### 1. 内容大小限制：80KB 硬阈值
+
+**位置**：[useFile.ts#L114](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts#L114)
+
+```typescript
+if (get().hasChanges && contents && contents.length < 80_000 && !isIframe() && !isFetchURL)
+```
+
+**影响分析**：
+- 以**字符数**（`contents.length`）而非字节数判断，UTF-8 多字节字符可能导致实际占用超出预期
+- 超过 80,000 字符时，**静默跳过保存**，不报错不提示
+- 用户编辑大文件时刷新页面会丢失内容（因从未写入 sessionStorage）
+
+| 内容规模 | JSON 字符数 | 保存结果 | 刷新后 |
+|---------|------------|---------|--------|
+| 小型 | < 80,000 | ✅ 保存到 sessionStorage | 内容恢复 |
+| 大型 | ≥ 80,000 | ❌ 不保存，无提示 | 恢复默认示例 JSON，内容丢失 |
+
+#### 2. JSON 嵌套深度：递归解析风险
+
+**保存层面**：嵌套深度不影响 `sessionStorage.setItem`，因为保存的是已字符串化的内容。
+
+**恢复层面**：嵌套深度会影响 `contentToJson()` 中的 `jsonc-parser` 和 `JSON.parse()`：
+- 现代浏览器 `JSON.parse` 通常支持数千层嵌套
+- 极端深度（>10,000 层）可能触发栈溢出或解析超时
+- 解析失败时会在 BottomBar 显示错误提示，但 sessionStorage 中的内容不会被清除
+
+**位置**：[useFile.ts#L121-L125](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts#L121-L125)
+
+```typescript
+} catch (error: any) {
+  if (error?.mark?.snippet) return set({ error: error.mark.snippet });
+  if (error?.message) set({ error: error.message });
+  useJson.setState({ loading: false });
+}
+```
+
+#### 3. 特殊字符与转义序列
+
+sessionStorage 使用 UTF-16 字符串存储，对 JSON 中的特殊字符有以下影响：
+
+| 特殊字符类型 | 示例 | 保存影响 | 恢复影响 |
+|------------|------|---------|---------|
+| **Unicode 字符** | `{"name": "测试 🎉"}` | ✅ 正常保存（UTF-16） | ✅ `JSON.parse` 正常恢复 |
+| **控制字符** | `{"text": "line1\u000Aline2"}` | ✅ 转义序列被当作普通字符存储 | ✅ `JSON.parse` 解释转义序列 |
+| **原始控制字符** | 字符串中包含真实的 `\n`（0x0A） | ⚠️ sessionStorage 可存储，但 `JSON.parse` 会失败 | ❌ 解析错误："Unexpected token" |
+| **代理对字符** | `{"emoji": "😀"}`（U+1F600） | ✅ 以 UTF-16 代理对存储 | ✅ 正常恢复 |
+| **反斜杠本身** | `{"path": "C:\\\\Users"}` | ✅ 字符串中的 `\\` 被正确存储 | ✅ 恢复为单个 `\` |
+| **双引号** | `{"quote": "\"Hello\""}` | ✅ `\"` 转义正常存储 | ✅ 恢复为 `"` |
+
+**关键风险点**：如果 JSON 字符串中包含**未转义的原始控制字符**（如真实换行符、制表符），`sessionStorage.setItem` 可正常保存，但 `JSON.parse` / `jsonc-parser` 在恢复时会抛出解析错误。
+
+#### 4. JSONC（带注释 JSON）的特殊处理
+
+**位置**：[jsonAdapter.ts#L7-L13](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/lib/utils/jsonAdapter.ts#L7-L13)
+
+```typescript
+if (format === FileFormat.JSON) {
+  const { parse } = await import("jsonc-parser");
+  const errors: ParseError[] = [];
+  const result = parse(value, errors);
+  if (errors.length > 0) JSON.parse(value);  // JSONC 解析失败时回退到标准 JSON.parse
+  return result;
+}
+```
+
+**保存与恢复行为**：
+- **保存**：JSONC 内容（含 `//` 注释或 `/* */` 注释）作为原始字符串直接存入 sessionStorage
+- **恢复**：优先使用 `jsonc-parser` 解析（支持注释），若解析出错则回退到标准 `JSON.parse`
+- **边界情况**：如果 JSONC 注释中包含看起来像 JSON 语法的内容，`jsonc-parser` 的容错机制可能产生非预期结果
+
+---
+
+### 12.5 格式转换（setFormat）对 sessionStorage 的连锁影响
+
+#### 用户切换格式的触发点
+
+**位置**：[BottomBar.tsx#L150-L171](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/features/editor/BottomBar.tsx#L150-L171)
+
+```typescript
+{formats.map(format => (
+  <Menu.Item
+    key={format.value}
+    onClick={() => setFormat(format.value)}  // 用户点击切换格式
+    rightSection={currentFormat === format.value && <IoMdCheckmark />}
+  >
+    {format.label}
+  </Menu.Item>
+))}
+```
+
+#### setFormat 的完整执行链
+
+**位置**：[useFile.ts#L86-L99](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts#L86-L99)
+
+```typescript
+setFormat: async format => {
+  try {
+    const prevFormat = get().format;
+
+    set({ format });  // ① 先更新 store 中的 format
+    // ② 将当前内容从旧格式解析为对象
+    const contentJson = await contentToJson(get().contents, prevFormat);
+    // ③ 将对象转换为新格式的字符串
+    const jsonContent = await jsonToContent(JSON.stringify(contentJson, null, 2), format);
+
+    get().setContents({ contents: jsonContent });  // ④ 保存新格式内容
+  } catch {
+    get().clear();
+    console.warn("The content was unable to be converted, so it was cleared instead.");
+  }
+},
+```
+
+#### 格式转换对 sessionStorage 的影响
+
+```
+用户在 BottomBar 点击切换格式（JSON → YAML）
+     │
+     ▼
+setFormat("yaml")
+     │
+     ├─ ① 更新 format = "yaml"
+     ├─ ② contentToJson(contents, "json") → 解析旧格式为对象
+     ├─ ③ jsonToContent(obj, "yaml") → 转换为 YAML 字符串
+     │
+     ▼
+setContents({ contents: yamlString })  ← hasChanges 默认为 true
+     │
+     ├─ 满足条件：hasChanges=true, contents存在, 长度<80KB, 非iframe, 非isFetchURL
+     │
+     ▼
+sessionStorage.setItem("content", yamlString)   ← ✅ 新格式内容被保存
+sessionStorage.setItem("format", "yaml")        ← ✅ format 同步更新
+```
+
+**格式转换失败的后果**：
+- 若转换过程中抛出异常（如 XML→CSV 结构不兼容），会执行 `get().clear()` 清空内容
+- sessionStorage 中的旧内容**不会被同步清除**，下次刷新可能恢复旧内容
+
+---
+
+### 12.6 综合影响矩阵
+
+| 影响维度 | JSON 格式 | YAML 格式 | XML 格式 | CSV 格式 |
+|---------|----------|----------|----------|----------|
+| **保存体积** | 基准 | 小 15-30% | 大 50-100% | 小 40-60% |
+| **80KB 限制** | 标准 | 不易触发 | 最易触发 | 最难触发 |
+| **解析复杂度** | 低（jsonc-parser） | 中（js-yaml） | 高（fast-xml-parser） | 中（json-2-csv） |
+| **format 丢失后果** | ✅ 恰好默认匹配 | ❌ 解析失败 | ❌ 解析失败 | ❌ 解析失败 |
+| **嵌套深度影响** | 中等 | 中等 | 高（标签递归） | 无（扁平化） |
+| **特殊字符敏感度** | 高（严格转义） | 低 | 中 | 低 |
+| **URL 导入入口可用** | ✅ 默认 | ❌ 需手动切换 | ❌ 需手动切换 | ❌ 需手动切换 |
+| **格式可逆性** | ✅ 无损 | ✅ 无损 | ⚠️ 可能丢失属性顺序 | ⚠️ 嵌套结构扁平化 |
+
+---
+
 ## 总结
 
 | 问题 | 结论 | 证据 |
@@ -831,6 +1124,7 @@ return fetch(url)  // 直接使用用户输入，无任何校验
 | **远程加载与本地恢复是否有明确界限？** | ⚠️ 名义上有，但存在漏洞 | 地址参数入口能正确隔离，但 URL 导入入口会将远程内容写入本地缓存 |
 | **压缩过程是否包含在流程中？** | ❌ 完全不存在 | 无压缩库依赖、无 base64 编码、所有持久化使用原始字符串 |
 | **两条远程加载路径是否一致？** | ❌ 存在显著差异 | 代码位置、URL 校验、缓存策略、错误处理均不同 |
+| **JSON 格式是否影响 sessionStorage？** | ✅ 多维度影响 | 大小限制、format 匹配、特殊字符、格式转换均影响保存恢复 |
 
 ### 核心发现
 
