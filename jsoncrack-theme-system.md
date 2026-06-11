@@ -2,7 +2,14 @@
 
 ## 一、系统架构概览
 
-JSON Crack 采用了**三层主题系统**协同工作的架构，同时通过**四条独立入口**（编辑器顶栏、画布偏好菜单、嵌入页 postMessage、VS Code / Chrome 扩展）驱动主题切换：
+JSON Crack 采用了**三层主题系统**协同工作的架构，同时通过**四类主题切换入口**（编辑器顶栏、画布偏好菜单、嵌入页 postMessage、VS Code / Chrome 扩展宿主环境）驱动主题切换。各入口的可用性按页面模式有所差异：
+
+| 入口 | `/editor` 编辑器页 | `/widget` 嵌入页 | VS Code 扩展 | Chrome 扩展 |
+|------|-------------------|-----------------|-------------|------------|
+| 顶栏 ThemeToggle | ✅ 可用 | ❌ 不存在（无顶栏） | ❌ 不存在 | ❌ 不存在 |
+| 画布偏好菜单（齿轮） | ✅ 可用 | ❌ `isWidget=true` 时被条件排除 | ❌ 不存在 | ❌ 不存在 |
+| postMessage（需携带 json） | N/A（未监听） | ✅ 唯一控制方式 | N/A | N/A |
+| 宿主环境主题（IDE/系统） | N/A | N/A | ✅ 只读 | ✅ 实时跟随 |
 
 | 层级 | 技术方案 | 覆盖范围 | 主题来源 |
 |------|----------|----------|----------|
@@ -215,26 +222,42 @@ React.useEffect(() => {
 | styled-components 同步 | `ThemeProvider theme={darkmodeEnabled ? darkTheme : lightTheme}` | `ThemeProvider theme={theme === "dark" ? darkTheme : lightTheme}` |
 | 画布主题传递 | `<JSONCrack theme={darkmodeEnabled ? "dark" : "light"}>` | `<GraphView isWidget>` → 内部同样读 `useConfig.darkmodeEnabled` |
 | 持久化 | Zustand persist → `localStorage["config"]` | 同样 Zustand persist（但每次 postMessage 都会覆盖） |
+| 画布工具栏（偏好菜单） | 渲染（`{!isWidget && <Toolbar />}`，L91） | **不渲染**（`isWidget=true` 时被 `{!isWidget}` 条件排除） |
+| 主题切换入口数 | 2 个（顶栏 ThemeToggle + 画布偏好菜单） | **0 个 UI 入口**，仅通过 `postMessage` 接收外部指令 |
 
-**嵌入页的双向同步链路**：
+**嵌入页的同步链路（含 postMessage 前置守卫）**：
 
 ```
-外部父页面 postMessage({options: {theme: "light"}})
-   ↓
-widget.tsx handler 接收
-   ├─→ setTheme("light")              → 本地 state 更新
-   ├─→ toggleDarkMode(false)          → Zustand store.darkmodeEnabled = false
-   │     └─→ localStorage["config"] 持久化
-   │     └─→ GraphView 内部 selector 触发重渲染
-   │           └─→ <JSONCrack theme="light" />
-   ↓
+外部父页面 postMessage({json: "...", options: {theme: "light"}})
+   │
+   ├─ [Guard] if (!event.data?.json) return;   ← widget.tsx L59：必须携带 json 字段
+   │    ↑ 若只传 theme 而不传 json，整条消息被直接丢弃
+   │
+   ├─→ [Conditional] if (event.data?.options?.theme === "light" || "dark")
+   │     ├─→ setTheme("light")              → 本地 state 更新
+   │     └─→ toggleDarkMode(false)          → Zustand store.darkmodeEnabled = false
+   │           └─→ localStorage["config"] 持久化
+   │           └─→ GraphView 内部 selector 触发重渲染
+   │                 └─→ <JSONCrack theme="light" />
+   │
+   ├─→ setContents(...)                      → JSON 数据同步
+   └─→ setDirection(...)                     → 布局方向同步
+
 useEffect([theme]) 触发
-   └─→ setColorScheme("light")        → Mantine 层更新
+   └─→ setColorScheme("light")               → Mantine 层更新
          └─→ localStorage["editor-color-scheme"] = "light"
 
 useEffect([theme]) 也触发 ThemeProvider 重渲染
-   └─→ <ThemeProvider theme={lightTheme}>  → styled-components 层更新
+   └─→ <ThemeProvider theme={lightTheme}>    → styled-components 层更新
 ```
+
+**嵌入页主题边界代码定位**：
+
+| 边界条件 | 仓库相对路径 | 行号 |
+|---------|-------------|-----|
+| postMessage 必须携带 `json` 字段 | `apps/www/src/pages/widget.tsx` | L59 `if (!event.data?.json) return;` |
+| theme 必须是 `"light"` 或 `"dark"` 才生效 | `apps/www/src/pages/widget.tsx` | L60 `if (event.data?.options?.theme === "light" \|\| ...)` |
+| widget 模式不渲染画布偏好菜单（无 UI 切换入口） | `apps/www/src/features/editor/views/GraphView/index.tsx` | L91 `{!isWidget && <Toolbar />}` |
 
 ### 2.5 主题切换入口四：外部客户端（VS Code / Chrome 扩展）
 
@@ -680,14 +703,15 @@ const theme = useConfig(state => (state.darkmodeEnabled ? "vs-dark" : "light"));
 └─ 3. 与场景 A 完全一致（同一个 Zustand store，同一个 toggleDarkMode）
 ```
 
-### 场景 C：嵌入页 — 外部 postMessage 传入主题
+### 场景 C：嵌入页 — 外部 postMessage 传入主题（必须携带 json）
 
 ```
 时间轴（从上到下）
 │
 ├─ 1. [外部消息] 父页面发送 postMessage({json: "...", options: {theme: "light"}})
+│   ↑ 注：若未携带 json 字段，L59 guard 直接 return，整条消息被丢弃
 │
-├─ 2. [widget.tsx handler] 接收并同步
+├─ 2. [widget.tsx handler] 接收并同步（主题参数在 json 检查之后处理）
 │   ├─ setTheme("light")                          → 组件本地 state
 │   └─ toggleDarkMode(false)                      → Zustand store + localStorage["config"]
 │
@@ -960,7 +984,30 @@ window.addEventListener("message", (event) => {
 });
 ```
 
-**主题参数的传递边界**：
-- `options.theme` 仅在 `postMessage` 中使用
-- Widget 页面接收后**立即同步**到 Zustand store（`toggleDarkMode`），确保所有三层主题系统一致更新
-- 后续用户在 widget 内通过 UI 切换主题时，会覆盖外部传入的值
+**主题参数的传递边界（基于代码事实）**：
+
+| 边界条件 | 代码事实（仓库相对路径 + 行号） | 说明 |
+|---------|-------------------------------|------|
+| 必须携带 `json` 字段 | `apps/www/src/pages/widget.tsx` L59：`if (!event.data?.json) return;` | **仅传 theme 不传 json 的消息会被直接丢弃**。主题参数的处理位于该 guard 之后（L60-L63），因此无法单独生效。 |
+| theme 取值校验 | `apps/www/src/pages/widget.tsx` L60：`=== "light" \|\| === "dark"` | 非这两个值的 theme 参数将被忽略，不会触发任何主题变更。 |
+| 无内嵌 UI 切换入口 | `apps/www/src/features/editor/views/GraphView/index.tsx` L91：`{!isWidget && <Toolbar />}` | Widget 模式下画布底部悬浮工具栏（含 Preferences 菜单中的主题切换项）不渲染，终端用户无法在 iframe 内手动切换主题，只能由父页面通过 postMessage 控制。 |
+| 无顶栏切换入口 | `apps/www/src/pages/widget.tsx` 中未引入 `Toolbar` | Widget 页面也没有编辑器顶栏的 ThemeToggle 按钮。 |
+| 主题与 JSON 同步更新 | `apps/www/src/pages/widget.tsx` L60-L66 | theme 参数与 json 数据在同一次 handler 调用中依次处理，随后由各自的 useEffect / selector 触发三层主题系统同步。 |
+| 持久化会被覆盖 | Zustand persist 机制 | 每次接收到合法的 postMessage（含 theme）都会覆盖 localStorage 中此前保存的主题值。 |
+
+**错误用法示例（被丢弃）**：
+```javascript
+// ❌ 只有 theme，没有 json → L59 直接 return，theme 参数不生效
+iframe.contentWindow.postMessage({
+  options: { theme: "light" }
+}, "*");
+```
+
+**正确用法示例**：
+```javascript
+// ✅ 同时携带 json 和 theme，两个参数一起生效
+iframe.contentWindow.postMessage({
+  json: JSON.stringify({ hello: "world" }),
+  options: { theme: "light", direction: "RIGHT" }
+}, "*");
+```
