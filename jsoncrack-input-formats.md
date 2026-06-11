@@ -164,10 +164,11 @@ setContents({ contents, hasChanges, skipUpdate, format })
   ├─ 2. contentToJson(get().contents, get().format)   ← 格式归一化的关键
   │     │  (定义见 apps/www/src/lib/utils/jsonAdapter.ts#L4-L45)
   │     │
-  │     ├─ format === "json" → jsonc-parser 的 parse()（容忍注释；若有错误回退 JSON.parse）
+  │     ├─ format === "json" → jsonc-parser 的 parse()（见下方错误处理说明）
   │     ├─ format === "yaml" → js-yaml 的 load()
   │     ├─ format === "xml"  → fast-xml-parser 的 XMLParser
-  │     │                        (attributeNamePrefix="$", ignoreAttributes=false)
+  │     │                        (attributeNamePrefix="$", ignoreAttributes=false,
+  │     │                         parseAttributeValue=true, parseTagValue=true)
   │     └─ format === "csv"  → json-2-csv 的 csv2json()
   │
   │     返回：统一的 JavaScript object / object[]
@@ -181,7 +182,7 @@ setContents({ contents, hasChanges, skipUpdate, format })
         → useJson.getState().setJson(JSON.stringify(json, null, 2))
 ```
 
-#### `contentToJson()` 详细——四种格式的解析路径
+#### `contentToJson()` 详细——四种格式的解析路径与边界
 
 定义在 `apps/www/src/lib/utils/jsonAdapter.ts#L4-L45`：
 
@@ -192,7 +193,39 @@ setContents({ contents, hasChanges, skipUpdate, format })
 | XML  | `fast-xml-parser` `XMLParser` | `apps/www/src/lib/utils/jsonAdapter.ts#L20-L31` | `object`（属性前缀 `$`） |
 | CSV  | `json-2-csv` `csv2json()` | `apps/www/src/lib/utils/jsonAdapter.ts#L33-L42` | `object[]` |
 
-所有格式最终输出一个标准的 JavaScript 对象（或对象数组），完成**格式归一化**。
+**JSON 格式的错误处理机制**（`jsonAdapter.ts#L7-L13`）：
+
+```ts
+const { parse } = await import("jsonc-parser");
+const errors: ParseError[] = [];
+const result = parse(value, errors);
+if (errors.length > 0) JSON.parse(value);   // ← 返回值被丢弃
+return result;
+```
+
+这里 `JSON.parse(value)` 的返回值**未被使用**，它的作用不是"回退到 `JSON.parse`"，而是**故意让 `JSON.parse` 抛出异常**。`jsonc-parser` 的 `parse()` 是容错的——遇到语法错误时仍会尽量返回部分解析结果，并填充 `errors` 数组。但 `contentToJson` 的调用方 `setContents()`（`useFile.ts#L115-L119`）在 catch 中会将错误信息存入 zustand state 供 UI 显示。因此这行代码的实际含义是：**若 jsonc-parser 报告语法错误，则用标准 `JSON.parse` 抛出一个干净的 SyntaxError，阻止不完整的解析结果进入后续链路**。
+
+注意：若输入包含合法的 JSONC 特性（如注释 `//...` 或尾逗号 `[1,]`），`jsonc-parser` 不会将它们记入 `errors`，`parse()` 返回结果与标准 JSON 对象等价，上述 `if` 分支不会进入，结果正常返回。但此行为**没有专门的测试覆盖**——单元测试 `parser.test.ts#L95-L99` 仅验证了语法错误的报告，未测试注释和尾逗号场景。
+
+**YAML 解析边界**（`jsonAdapter.ts#L15-L18`）：
+
+- `js-yaml` 的 `load()` 支持 YAML 1.2 全集，包括多文档、锚点/别名、自定义标签等
+- 但输出到后续链路时只保留标准 JSON 兼容类型（string/number/boolean/null/object/array）
+- YAML 特有结构（如 `&anchor` / `*alias`）在解析阶段即被 `js-yaml` 展开为实际值，转回 YAML 时无法还原原始锚点语法
+
+**XML 解析边界**（`jsonAdapter.ts#L20-L31`）：
+
+- `XMLParser` 配置 `attributeNamePrefix: "$"` + `ignoreAttributes: false`，所有 XML 属性以 `$` 前缀存入对象
+- 配置 `parseAttributeValue: true` + `parseTagValue: true`，属性值和标签文本会尝试转为 number/boolean
+- 转回 XML 时（`jsonToContent`，`jsonAdapter.ts#L62-L71`），`XMLBuilder` 使用同样的 `attributeNamePrefix: "$"` + `ignoreAttributes: false`，仅将 `$` 前缀的键识别为属性——**如果用户在 JSON 侧手动编辑了带 `$` 前缀的键，它们会被错误地识别为 XML 属性**
+- XML 文档顺序、命名空间前缀、CDATA 段在往返转换中不保证保留
+
+**CSV 解析边界**（`jsonAdapter.ts#L33-L42`）：
+
+- `csv2json()` 输出始终是 `object[]`（行数组），这是 CSV 的天然结构
+- `excelBOM: true` 选项会处理 UTF-8 BOM 标记
+- `wrapBooleans: true` 将布尔值在 CSV 文本中包装为字符串 `"true"/"false"`
+- 转回 CSV 时（`jsonToContent`，`jsonAdapter.ts#L73-L86`），若输入不是数组则包装为 `[parsedJson]`，但 `expandArrayObjects: true` + `expandNestedObjects: true` 会**展开嵌套对象和数组**——这意味着深层结构在 CSV 中被扁平化为点号分隔的列名，再转回 JSON 时无法还原原始嵌套层级
 
 ### 阶段 C：JSON 字符串流入 `useJson` store
 
@@ -307,7 +340,25 @@ parseGraph(json: string) → ParseGraphResult (extends GraphData + { errors })
 - 扁平对象 → 1 节点多行文本（`L18-L30`）
 - 嵌套对象 → 2 节点 + 1 条边，`edge.text === 属性名`（`L32-L43`）
 - 数组 → 父节点 + N 个子节点 + N 条边（`L45-L86`）
-- 错误容忍：语法错误仍返回部分树，`errors.length > 0`（`L95-L99`）
+
+**parseGraph 错误计数的含义与用途**：
+
+`parseGraph()` 返回 `ParseGraphResult`，其中 `errors: ParseError[]` 来自 `jsonc-parser` 的 `parseTree()`（`parser.ts#L10-L11`）。上层 `parseJsonGraph()`（`canvasHelpers.ts#L74-L90`）将其转化为 `syntaxErrorCount: graph.errors.length`，并放入 `kind: "ok"` 的判别联合中。
+
+在 `JSONCrackComponent.tsx#L193-L198` 中，`syntaxErrorCount` 的消费方式为：
+```ts
+const { graph, syntaxErrorCount } = result;
+if (syntaxErrorCount > 0) {
+  callbacksRef.current.onParseError?.(
+    new Error(`Failed to parse data (${syntaxErrorCount} syntax error(s)).`)
+  );
+}
+// 注意：即使有语法错误，graph.nodes 和 graph.edges 仍被正常设置——图照常渲染
+setNodes(graph.nodes);
+setEdges(graph.edges);
+```
+
+即：**syntaxErrorCount 仅用于触发 `onParseError` 回调通知宿主，不阻止图的渲染**。jsonc-parser 的容错 `parseTree()` 在遇到语法错误时仍会尽力构建部分 AST，因此图可能展示不完整但不会空白。单元测试（`parser.test.ts#L95-L99`）验证的正是这一点：输入 `{"broken": }`，`errors.length > 0` 且 `nodes.length >= 0`。测试没有覆盖注释、尾逗号等 JSONC 特性场景。
 
 ---
 
@@ -678,7 +729,7 @@ Chrome 扩展宿主 (apps/chrome-extension/src/content-script.tsx)
 
 ---
 
-## 6. 格式转换的双向管道
+## 6. 格式转换的双向管道与边界
 
 除了输入解析，`apps/www/src/lib/utils/jsonAdapter.ts` 还提供反向转换 `jsonToContent()`（`L47-L93`），用于格式切换（BottomBar 中的格式菜单，见 `apps/www/src/features/editor/BottomBar.tsx#L151-L171`）：
 
@@ -698,7 +749,16 @@ setFormat(newFormat)                    apps/www/src/store/useFile.ts#L86-L98
   └─ setContents({ contents: jsonContent })  ← 新格式文本重新走解析链路
 ```
 
-这确保用户在 BottomBar 切换格式时，编辑器中的内容能在四种格式之间无损互转。
+**格式转换不是无损的**，各方向存在已知边界：
+
+| 转换方向 | 丢失/变形内容 | 原因 |
+|---------|-------------|------|
+| JSON → YAML → JSON | YAML 原始注释、锚点/别名、自定义标签 | `js-yaml` 的 `dump()` 只按标准序列化输出，不还原 YAML 特有语法 |
+| JSON → XML → JSON | 文档顺序可能改变；命名空间前缀、CDATA 段丢失 | `XMLBuilder` 不保留原始 XML 元素顺序信息，命名空间和 CDATA 不在 `XMLParser` 的解析模型中 |
+| JSON → XML → JSON | 带 `$` 前缀的键被误识别为属性 | `attributeNamePrefix: "$"` 是双向约定，但用户在 JSON 侧手动添加的 `$key` 也会被当作属性 |
+| JSON → CSV → JSON | 嵌套结构被扁平化；非数组对象被包装为单行数组 | `expandArrayObjects: true` + `expandNestedObjects: true` 将深层键展开为点号列名，`csv2json` 还原后只有扁平对象 |
+| JSON → CSV → JSON | 数值/布尔值类型可能变为字符串 | CSV 本质上是文本格式，`wrapBooleans: true` 将布尔值写为 `"true"/"false"` 字符串 |
+| 任意格式 → JSON → 原格式 | 原始格式中的空白、缩进风格 | `jsonToContent` 总是重新序列化，不保留原始文本格式 |
 
 ---
 
@@ -798,7 +858,7 @@ setFormat(newFormat)                    apps/www/src/store/useFile.ts#L86-L98
 
 1. **格式适配层前置**：`contentToJson()` 在 `useFile.setContents()` 中率先将任意格式转为 JS 对象，后续链路只需处理 JSON（`apps/www/src/lib/utils/jsonAdapter.ts#L4-L45`）。
 2. **双类型输入兼容**：`JSONCrack` 组件的 `json` prop 接受 `string | object`（`packages/jsoncrack-react/src/canvasHelpers.ts#L8`），`toJsonText()` 内部做归一化，并使用 WeakMap 缓存对象序列化结果。
-3. **容错 JSON 解析**：核心 `parseGraph()` 使用 `jsonc-parser` 的 `parseTree()`，容忍 JSON 中的注释和尾逗号；单元测试 `packages/jsoncrack-react/src/__tests__/parser.test.ts#L95-L99` 验证了此特性。
+3. **JSON 解析的两层容错**：`contentToJson()` 中 `jsonc-parser` 的 `parse()` 容错返回部分结果，但当 `errors.length > 0` 时故意调 `JSON.parse()` 抛异常阻止不完整数据进入后续链路（`apps/www/src/lib/utils/jsonAdapter.ts#L7-L13`）；`parseGraph()` 中 `jsonc-parser` 的 `parseTree()` 同样容错，但 `syntaxErrorCount` 仅触发 `onParseError` 回调不阻止渲染（`packages/jsoncrack-react/src/JSONCrackComponent.tsx#L193-L198`）。两层的容错策略不同：前者阻断，后者放行并通知。
 4. **防抖更新**：编辑器输入经 400ms 防抖后写入 `useJson`（`apps/www/src/store/useFile.ts#L67-L69`），避免频繁重绘。
 5. **会话恢复**：`sessionStorage` 同时保存 `contents`（原始格式文本）和 `format`，刷新后 `checkEditorSession()` 正确恢复并重新走完整链路（`apps/www/src/store/useFile.ts#L142-L154`）。
 6. **VSCode 三命令策略各异，不得混淆**：
@@ -808,4 +868,4 @@ setFormat(newFormat)                    apps/www/src/store/useFile.ts#L86-L98
    - 三条命令 Webview 侧接收逻辑共用同一套：只要收到 `event.data.json` 为字符串就更新 state，驱动 `<JSONCrack>` 渲染（`apps/vscode/src/App.tsx#L26-L41`）
 7. **Chrome Worker 规避**：导入 `jsoncrack-react` 前临时 shadow 全局 `Worker`（`apps/chrome-extension/src/content-script.tsx#L38-L47`），使 ELK 走同步路径，应对 JSON 响应页的严格 CSP。
 8. **外部集成直通**：VSCode 扩展和 Chrome 扩展跳过 `useFile`/`jsonAdapter`（它们本身已确定是 JSON），直接将 JSON 传入 `<JSONCrack>`，由 `toJsonText()` + `parseGraph()` 处理，复用同一核心解析器。
-9. **双向格式桥**：`contentToJson()` + `jsonToContent()` 构成完整双向转换（`apps/www/src/lib/utils/jsonAdapter.ts`），BottomBar 切换格式时能无损互转（`apps/www/src/store/useFile.ts#L86-L98`）。
+9. **双向格式桥有损**：`contentToJson()` + `jsonToContent()` 构成双向转换管道（`apps/www/src/lib/utils/jsonAdapter.ts`），BottomBar 切换格式时使用（`apps/www/src/store/useFile.ts#L86-L98`），但 CSV 扁平化嵌套结构、XML `$` 前缀污染属性名、YAML 丢失注释/锚点，均非无损——详见 §6 边界表。
