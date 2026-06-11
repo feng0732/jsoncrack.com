@@ -115,9 +115,29 @@ useHotkeys(
     ["mod+s", () => setVisible("DownloadModal", true)],     // 导出
     ["mod+shift+d", toggleDirection],                       // 旋转布局
   ],
-  []  // 空依赖数组，组件挂载时注册一次
+  []  // tagsToIgnore：空数组 = 不忽略任何元素
 );
 ```
+
+**`useHotkeys` 的真实 API 签名**（[Mantine 官方文档](https://mantine.dev/hooks/use-hotkeys/)）：
+
+```typescript
+function useHotkeys(
+  hotkeys: HotkeyItem[],                                    // 第一个参数：快捷键列表
+  tagsToIgnore?: string[] = ['INPUT', 'TEXTAREA', 'SELECT'], // 第二个参数：忽略的 HTML 标签
+  triggerOnContentEditable?: boolean = false                 // 第三个参数：是否在 contentEditable 上触发
+): void;
+```
+
+**第二个参数 `tagsToIgnore` 的含义**：
+
+| 传值 | 效果 |
+|------|------|
+| 不传（默认） | 当焦点在 `INPUT`、`TEXTAREA`、`SELECT` 元素时，快捷键**不触发** |
+| `[]`（空数组） | **不忽略任何元素**，焦点在输入框中时快捷键**仍然触发** |
+| `['INPUT']` | 仅在 `INPUT` 元素中忽略快捷键 |
+
+**本项目传 `[]` 的影响**：焦点在搜索输入框或 JSON 文本编辑器中时，全局快捷键（如 `Ctrl+S` 导出、`Ctrl+F` 搜索）**仍然生效**。这与 `tagsToIgnore` 的默认行为（在输入框中屏蔽快捷键）相反，是有意为之的设计选择。
 
 **关键点**：
 - `usePhysicalKeys: true`：使用物理键码，不受键盘布局影响
@@ -154,7 +174,7 @@ useHotkeys(
 </ActionIcon>
 ```
 
-### 2.4 局部快捷键处理
+### 2.4 局部快捷键处理与输入框聚焦
 
 在 [SearchInput.tsx](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/Toolbar/SearchInput.tsx#L68-L72) 中使用 `getHotkeyHandler` 处理组件级快捷键：
 
@@ -166,7 +186,46 @@ onKeyDown={getHotkeyHandler([
 ])}
 ```
 
-这种方式确保快捷键仅在组件获得焦点时生效，避免与全局快捷键冲突。
+**`getHotkeyHandler` 与 `useHotkeys` 的协作关系**：
+
+两者采用**不同层级的快捷键处理机制**，且互不冲突：
+
+| 机制 | 绑定方式 | 生效范围 | 与输入框的关系 |
+|------|---------|---------|--------------|
+| `useHotkeys` | `document.addEventListener("keydown")` | 全局（document 级别） | 因 `tagsToIgnore=[]`，输入框聚焦时仍生效 |
+| `getHotkeyHandler` | `onKeyDown` prop | 仅绑定元素获得焦点时 | 只在搜索输入框聚焦时生效 |
+
+**两者如何避免冲突**：
+
+1. **`Ctrl+F`（全局）vs `Enter`（局部）**：按键不重叠，无冲突
+2. **`Escape`（局部）**：`useHotkeys` 没有注册 `Escape` 快捷键，所以 `Escape` 仅被 `getHotkeyHandler` 捕获，关闭搜索
+3. **`Ctrl+S`（全局）在输入框聚焦时**：因 `tagsToIgnore=[]`，输入框聚焦时按 `Ctrl+S` 仍会触发导出，而不是在输入框中输入文本
+
+**事件冒泡链路**：
+
+```
+用户在搜索输入框中按键
+    ↓
+1. SearchInput 的 onKeyDown (getHotkeyHandler) 先执行
+   ├─ Enter → next()，事件被处理
+   ├─ Shift+Enter → prev()，事件被处理
+   └─ Escape → handleClose()，事件被处理
+    ↓
+2. useHotkeys 的 document keydown listener 后执行
+   ├─ Ctrl+F → handleSearchToggle()（关闭搜索后再开）
+   ├─ Ctrl+S → 打开导出模态框
+   └─ 其他全局快捷键 → 正常触发
+```
+
+**搜索输入框自动聚焦**：[SearchInput.tsx#L43-L45](file:///d:/fz/0601/solo-dogfeeding/code/192-jsoncrack.com/apps/www/src/features/editor/Toolbar/SearchInput.tsx#L43-L45) 在组件挂载时自动聚焦输入框：
+
+```typescript
+React.useEffect(() => {
+  inputRef.current?.focus({ preventScroll: true });
+}, []);
+```
+
+这使得用户按 `Ctrl+F` 打开搜索后，可以立即输入搜索词，且 `Enter`/`Escape` 等局部快捷键立即可用。
 
 ### 2.5 快捷键检测与提示
 
@@ -694,6 +753,8 @@ useConfig store 更新 darkmodeEnabled 状态，persist 到 localStorage  [useCo
 8. **单一数据源**：主题状态由 `useConfig.darkmodeEnabled` 统一管理，五层主题同步都从同一数据源派生，确保一致性
 9. **策略差异化**：主题切换时 JSONCrack 画布通过 prop 更新（不重建），而网格/手势通过 key 变化重建，针对不同场景采用不同的更新策略
 10. **埋点策略不一致**：Preferences 菜单中滚轮缩放和标尺开关有 gaEvent 埋点（记录切换前状态），但主题切换无埋点；浮动工具栏的缩放/居中按钮有 gaEvent，但对应的快捷键无 gaEvent
+11. **快捷键不屏蔽输入框**：`useHotkeys` 的 `tagsToIgnore=[]` 使得全局快捷键在输入框聚焦时仍生效，与 Mantine 默认行为相反，确保搜索框和文本编辑器中快捷键不被屏蔽
+12. **双层快捷键机制**：全局快捷键（`useHotkeys`）和局部快捷键（`getHotkeyHandler`）通过按键不重叠和事件冒泡顺序协作，无需 `stopPropagation`
 
 ### 7.2 数据流方向
 
@@ -703,6 +764,18 @@ useConfig store 更新 darkmodeEnabled 状态，persist 到 localStorage  [useCo
 快捷键/按钮 → 动作函数 (+GA埋点) → Zustand Store → UI 组件 → 用户反馈
     ↑                                                    │
     └──────────────────── 状态订阅 ──────────────────────┘
+```
+
+**快捷键触发的两条路径**：
+
+```
+路径 A：全局快捷键（useHotkeys）
+  document.keydown → useHotkeys handler → store action → UI 更新
+  ⚠️ tagsToIgnore=[] → 输入框聚焦时仍生效
+
+路径 B：局部快捷键（getHotkeyHandler）
+  element.keydown → onKeyDown handler → 直接调用函数
+  ⚠️ 仅在绑定元素聚焦时生效
 ```
 
 ### 7.3 快捷键清单（对齐真实代码）
