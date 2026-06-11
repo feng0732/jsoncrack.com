@@ -563,6 +563,13 @@ const data = JSON.parse(pako.inflateRaw(compressed, { to: 'string' }));
 | 工具栏 UI（无分享按钮） | [Toolbar/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/features/editor/Toolbar/index.tsx) | L64-L108 |
 | FileMenu（无分享选项） | [FileMenu.tsx](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/features/editor/Toolbar/FileMenu.tsx) | L9-L41 |
 | 嵌入文档示例 | [docs.tsx](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/pages/docs.tsx) | L28-L58 |
+| ImportModal URL 导入 | [ImportModal/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/features/modals/ImportModal/index.tsx) | L19-L32 |
+| ImportModal 文件导入 | [ImportModal/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/features/modals/ImportModal/index.tsx) | L33-L46 |
+| format 默认值（initialStates） | [useFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts) | L50-L57 |
+| setContents format 回退逻辑 | [useFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts) | L100-L107 |
+| BottomBar 格式切换器 | [BottomBar.tsx](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/features/editor/BottomBar.tsx) | L150-L171 |
+| setFile（服务端文件加载） | [useFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts) | L78-L82 |
+| setFormat 格式转换 | [useFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts) | L86-L99 |
 
 ---
 
@@ -823,9 +830,336 @@ return fetch(url)  // 直接使用用户输入，无任何校验
 
 ---
 
-## 十二、URL 导入 JSON 格式对 sessionStorage 保存与恢复的影响
+## 十二、逐段代码分析：URL 导入后 format 为什么不会自动重置为 JSON
 
-### 12.1 sessionStorage 保存的两个核心字段
+### 12.1 问题来源
+
+很多人会有这个疑问：**通过 URL 加载远程 JSON 后，当前格式（format）为什么不会自动重置为 JSON？**
+
+答案在于代码实现的一个细节设计——**URL 导入路径没有显式设置 format**，format 始终保留调用前的状态。下面逐段追踪代码，完整还原 format 状态的变化路径。
+
+---
+
+### 12.2 初始状态：format 的默认值
+
+**位置**：[useFile.ts#L50-L57](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts#L50-L57)
+
+```typescript
+const initialStates = {
+  fileData: null as File | null,
+  format: FileFormat.JSON,  // ← 初始值：json
+  contents: defaultJson,
+  error: null as any,
+  hasChanges: false,
+  jsonSchema: null as object | null,
+};
+```
+
+**结论**：页面首次加载时，format 默认值为 `FileFormat.JSON`（即 `"json"`）。
+
+---
+
+### 12.3 地址参数入口：checkEditorSession → fetchUrl 路径
+
+让我们逐段追踪用户访问 `/editor?json=<URL>` 时，format 经历了什么。
+
+#### 第一步：checkEditorSession 入口
+
+**位置**：[useFile.ts#L142-L154](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts#L142-L154)
+
+```typescript
+checkEditorSession: (url, widget) => {
+  // 分支一：URL 有效 → 调用 fetchUrl
+  if (url && typeof url === "string" && isURL(url)) {
+    return get().fetchUrl(url);  // ← 注意：只传了 url，没有传 format
+  }
+
+  // 分支二：本地恢复
+  let contents = defaultJson;
+  const sessionContent = sessionStorage.getItem("content") as string | null;
+  const format = sessionStorage.getItem("format") as FileFormat | null;
+  if (sessionContent && !widget) contents = sessionContent;
+
+  if (format) set({ format });  // ← 本地恢复时会设置 format
+  get().setContents({ contents, hasChanges: false });
+},
+```
+
+**关键观察**：
+- ✅ **本地恢复分支**：会从 sessionStorage 读取 format 并调用 `set({ format })`
+- ❌ **远程加载分支**：直接调用 `get().fetchUrl(url)`，**完全没有涉及 format 的设置**
+
+#### 第二步：fetchUrl 内部
+
+**位置**：[useFile.ts#L129-L141](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts#L129-L141)
+
+```typescript
+fetchUrl: async url => {
+  try {
+    const res = await fetch(url);
+    const json = await res.json();
+    const jsonStr = JSON.stringify(json, null, 2);
+
+    get().setContents({ contents: jsonStr });  // ← 只传了 contents，没有传 format！
+    return useJson.setState({ json: jsonStr, loading: false });
+  } catch {
+    get().clear();
+    toast.error("Failed to fetch document from URL!");
+  }
+},
+```
+
+**关键观察**：
+- `fetchUrl` 的职责是"获取 URL 内容并设置到编辑器"
+- 它只设置了 `contents`，**完全没有修改 format**
+- 既然没有修改，format 就保持调用 `fetchUrl` 之前的值
+
+#### 第三步：setContents 中 format 的处理
+
+**位置**：[useFile.ts#L100-L107](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts#L100-L107)
+
+```typescript
+setContents: async ({ contents, hasChanges = true, skipUpdate = false, format }) => {
+  try {
+    set({
+      ...(contents && { contents }),
+      error: null,
+      hasChanges,
+      format: format ?? get().format,  // ← format 未指定时，使用当前值！
+    });
+```
+
+**关键逻辑**：`format: format ?? get().format`
+- `??` 是空值合并运算符
+- 如果传入的 `format` 是 `undefined`（即没传），就使用 `get().format`（当前值）
+- 由于 `fetchUrl` 调用 `setContents` 时**没有传 format 参数**，所以 format 保持原样
+
+#### 第四步：保存到 sessionStorage
+
+**位置**：[useFile.ts#L114-L117](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts#L114-L117)
+
+```typescript
+if (get().hasChanges && contents && contents.length < 80_000 && !isIframe() && !isFetchURL) {
+  sessionStorage.setItem("content", contents);
+  sessionStorage.setItem("format", get().format);  // ← 保存的是当前 format
+  set({ hasChanges: true });
+}
+```
+
+> **⚠️ 但注意**：地址参数入口时 `isFetchURL = true`（因为 URL 含 `?`），所以**不会写入 sessionStorage**。这部分内容我们在第十一章已经讨论过。
+
+---
+
+### 12.4 场景演示：先切 YAML 再用 URL 导入
+
+让我们用一个具体场景来演示 format 不会自动重置的问题。
+
+| 步骤 | 用户操作 | format 值 | contents | 说明 |
+|------|---------|----------|----------|------|
+| 1 | 打开编辑器 | `"json"` | 默认示例 | 初始状态 |
+| 2 | 在 BottomBar 点击切换到 YAML | `"yaml"` | 转换为 YAML 格式的内容 | 用户主动切换格式 |
+| 3 | 打开 ImportModal，输入远程 JSON URL，点击 Import | **`"yaml"`** | **JSON 字符串** | ⚠️ 问题出现了！ |
+| 4 | contentToJson 用 yaml 解析器解析 JSON 内容 | `"yaml"` | JSON 字符串 | ❌ 解析失败，显示错误 |
+
+**第三步的详细执行路径**：
+
+```
+用户在 ImportModal 输入 URL → 点击 Import
+    │
+    ▼
+handleImportFile()  ← [ImportModal/index.tsx#L18-L32]
+    │
+    ├─ toast.loading("Loading...")
+    ├─ gaEvent("fetch_url")
+    │
+    ▼
+fetch(url)
+    │
+    ▼
+res.json()  ← 服务器返回的 JSON 被解析为对象
+    │
+    ▼
+JSON.stringify(json, null, 2)  ← 重新序列化为 JSON 字符串
+    │
+    ▼
+setContents({ contents: jsonStr })  ← 只传了 contents！没有传 format！
+    │
+    ├─ set({ contents: jsonStr, format: undefined ?? get().format })
+    │                      └─ format = undefined → 用当前值 "yaml"
+    │
+    └─ format 保持为 "yaml" 不变 ← ⚠️ 这就是问题所在
+```
+
+---
+
+### 12.5 ImportModal 中：URL 导入 vs 文件导入的对比
+
+**ImportModal 有两个导入分支**，它们对 format 的处理方式完全不同：
+
+| 对比项 | URL 导入分支 | 文件导入分支 |
+|--------|------------|-----------|
+| **代码位置** | [ImportModal/index.tsx#L19-L32](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/features/modals/ImportModal/index.tsx#L19-L32) | [ImportModal/index.tsx#L33-L46](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/features/modals/ImportModal/index.tsx#L33-L46) |
+| **format 处理** | ❌ 不设置 format，保持当前值 | ✅ `setFormat(format as FileFormat)` |
+| **format 来源** | 无（保持原样） | 从文件名后缀提取（`file.name`） |
+| **内容与格式一致性** | ⚠️ 可能不一致（内容是 JSON，但 format 可能不是） | ✅ 一致（文件名后缀决定格式） |
+| **解析结果** | 可能失败（format 不匹配时） | 通常成功 |
+
+**文件导入分支的代码**：
+```typescript
+} else if (file) {
+  const lastIndex = file.name.lastIndexOf(".");
+  const format = file.name.substring(lastIndex + 1);
+  setFormat(format as FileFormat);  // ← ✅ 显式设置 format
+
+  file.text().then(text => {
+    setContents({ contents: text });  // ← 后设置内容
+    // ...
+  });
+  // ...
+}
+```
+
+> **对比结论**：文件导入时**先 setFormat 再 setContents**，确保 format 与内容一致；但 URL 导入时**只 setContents，不设置 format**，导致 format 保持为调用前的任意值。
+
+---
+
+### 12.6 三条远程/外部加载路径的 format 处理对比
+
+JSON Crack 中至少有三条外部数据加载路径，它们对 format 的处理各不相同：
+
+| 加载路径 | 触发方式 | 是否设置 format | format 来源 | 内容与格式一致性 |
+|---------|---------|---------------|------------|---------------|
+| **地址参数入口** | `/editor?json=<URL>` | ❌ 不设置 | 保持当前值（默认 json） | ⚠️ 多数情况下一致（默认 json），但用户切过格式就不一致 |
+| **ImportModal URL 导入** | File → Import → 输入 URL | ❌ 不设置 | 保持当前值 | ⚠️ 可能不一致 |
+| **ImportModal 文件导入** | File → Import → 上传文件 | ✅ 设置 | 文件名后缀 | ✅ 一致 |
+| **setFile（服务端文件）** | 从云端加载文件 | ✅ 设置 | `fileData.format` | ✅ 一致 |
+
+**setFile 的实现**（格式处理最严谨）：
+```typescript
+setFile: fileData => {
+  set({ fileData, format: fileData.format || FileFormat.JSON });  // ← 显式设置 format
+  get().setContents({ contents: fileData.content, hasChanges: false });
+  gaEvent("set_content", { label: fileData.format });
+},
+```
+
+---
+
+### 12.7 对 sessionStorage 保存与恢复的连锁影响
+
+现在把 format 问题和 sessionStorage 串联起来分析。
+
+#### 场景 A：地址参数入口（isFetchURL = true）
+
+```
+用户访问 /editor?json=<URL>
+    │
+    ├─ format 保持为 json（初始值）
+    ├─ contents 设置为远程 JSON 内容
+    ├─ isFetchURL = true（URL 含 ?）
+    │
+    ▼
+    不写入 sessionStorage
+    （因为 !isFetchURL 条件不满足）
+```
+
+**影响**：
+- sessionStorage 中保留的是上一次本地编辑的内容和 format
+- 远程加载的内容**不会污染** sessionStorage
+- 但如果用户之前切过格式、存了 YAML，刷新后从 sessionStorage 恢复时还是 YAML，不会因为 URL 加载了 JSON 就自动变回去
+
+#### 场景 B：ImportModal URL 导入（isFetchURL = false）
+
+```
+用户直接访问 /editor → 切到 YAML → ImportModal 导入远程 URL
+    │
+    ├─ format 保持为 yaml（用户之前切的）
+    ├─ contents 设置为远程 JSON 内容（注意：内容是 JSON 字符串！）
+    ├─ isFetchURL = false（URL 不含 ?）
+    │
+    ▼
+    满足所有保存条件 → 写入 sessionStorage
+    ├─ content = JSON 字符串
+    └─ format = "yaml"  ← ⚠️ 错误！内容是 JSON，但 format 标成了 yaml
+```
+
+**影响——保存时**：
+- sessionStorage 中存储了 **content 是 JSON 但 format 是 yaml** 的"错误配对"
+- 下次恢复时，会用 YAML 解析器去解析 JSON 内容，**必然失败**
+
+**影响——恢复时**：
+```
+用户刷新页面
+    │
+    ├─ checkEditorSession() 调用
+    │    ├─ query.json 为空 → 走本地恢复分支
+    │    ├─ 从 sessionStorage 读 format = "yaml"
+    │    ├─ 先 set({ format: "yaml" })
+    │    └─ 再 setContents({ contents: <JSON 字符串> })
+    │
+    ├─ setContents 内部调用 contentToJson(contents, "yaml")
+    │    └─ YAML 解析器解析 JSON 字符串 → 报错！
+    │
+    └─ BottomBar 显示 "Invalid" + 错误信息
+```
+
+> **⚠️ 这是一个隐藏 Bug**：用户先切到非 JSON 格式，再通过 ImportModal 导入远程 URL，会导致 sessionStorage 中 content 与 format 不匹配，刷新页面后解析失败。
+
+---
+
+### 12.8 根因总结与修复建议
+
+#### 根本原因
+
+URL 导入路径（包括地址参数入口和 ImportModal URL 导入）**没有显式将 format 设置为 JSON**，而 URL fetch 得到的内容一定是 JSON（因为 `res.json()` 解析后再 `JSON.stringify`），导致 content 与 format 可能不一致。
+
+#### 为什么会这样设计？
+
+可能的原因：
+1. **默认就是 JSON**：多数情况下用户不会切换格式，所以不设置也没问题
+2. **职责分离**：`fetchUrl` 的职责是"加载 URL 内容"，不负责改格式
+3. **历史遗留**：早期只有 JSON 格式，后来加了多格式支持但 URL 导入路径没同步更新
+
+#### 修复建议
+
+**方案 1：在 fetchUrl 中显式设置 format 为 JSON**
+
+```typescript
+fetchUrl: async url => {
+  try {
+    const res = await fetch(url);
+    const json = await res.json();
+    const jsonStr = JSON.stringify(json, null, 2);
+
+    get().setContents({ contents: jsonStr, format: FileFormat.JSON });  // ← 加上 format
+    return useJson.setState({ json: jsonStr, loading: false });
+  } catch {
+    get().clear();
+    toast.error("Failed to fetch document from URL!");
+  }
+},
+```
+
+**方案 2：ImportModal URL 导入分支先调用 setFormat**
+
+```typescript
+if (url) {
+  setFile(null);
+  setFormat(FileFormat.JSON);  // ← 先设置格式
+  toast.loading("Loading...", { id: "toastFetch" });
+  // ...
+}
+```
+
+**方案 3：在 setContents 中添加智能判断（不推荐）**
+
+不建议，因为会增加复杂度且破坏单一职责。
+
+---
+
+## 十三、URL 导入 JSON 格式对 sessionStorage 保存与恢复的影响
+
+### 13.1 sessionStorage 保存的两个核心字段
 
 **位置**：[useFile.ts#L114-L117](file:///d:/fz/0601/solo-dogfeeding/code/188-jsoncrack.com/apps/www/src/store/useFile.ts#L114-L117)
 
@@ -1125,6 +1459,7 @@ sessionStorage.setItem("format", "yaml")        ← ✅ format 同步更新
 | **压缩过程是否包含在流程中？** | ❌ 完全不存在 | 无压缩库依赖、无 base64 编码、所有持久化使用原始字符串 |
 | **两条远程加载路径是否一致？** | ❌ 存在显著差异 | 代码位置、URL 校验、缓存策略、错误处理均不同 |
 | **JSON 格式是否影响 sessionStorage？** | ✅ 多维度影响 | 大小限制、format 匹配、特殊字符、格式转换均影响保存恢复 |
+| **URL 导入后 format 会自动重置为 JSON 吗？** | ❌ 不会自动重置 | fetchUrl 和 ImportModal URL 导入均不设置 format，保持调用前的值 |
 
 ### 核心发现
 
@@ -1137,7 +1472,19 @@ sessionStorage.setItem("format", "yaml")        ← ✅ format 同步更新
    - 当用户通过 ImportModal 导入远程 URL 时，页面地址栏无 `?`，导致 `isFetchURL = false`
    - 远程数据被误写入 sessionStorage，下次刷新时被当作"本地内容"恢复
 
-3. **代码层面的其他差异**：
+3. **URL 导入后 format 不会自动重置为 JSON**：
+   - `fetchUrl` 调用 `setContents` 时只传 `contents`，不传 `format`
+   - `setContents` 中 `format: format ?? get().format`，没传就用当前值
+   - 若用户之前切换过格式（如 YAML），URL 导入后 content 是 JSON 但 format 仍是 YAML
+   - 会导致 sessionStorage 中 content 与 format 不匹配，刷新后解析失败
+
+4. **多路径 format 处理不一致**：
+   - `setFile`（服务端文件）：显式设置 format，最严谨
+   - ImportModal 文件导入：从文件名提取 format 并设置
+   - ImportModal URL 导入：不设置 format，保持当前值
+   - 地址参数入口（fetchUrl）：不设置 format，保持当前值
+
+5. **代码层面的其他差异**：
    - 地址参数入口有 `isURL()` 严格正则校验，URL 导入入口无校验
    - 地址参数入口错误时清空内容，URL 导入入口仅显示错误提示
    - URL 导入入口有 GA 埋点，地址参数入口无埋点
